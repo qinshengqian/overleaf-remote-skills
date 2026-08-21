@@ -1,0 +1,71 @@
+{
+  "name": "@aloth/olcli",
+  "version": "0.3.0",
+  "description": "Command-line interface for Overleaf — Sync, manage, and compile LaTeX projects from your terminal",
+  "type": "module",
+  "bin": {
+    "olcli": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "lint": "eslint src/",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "overleaf",
+    "overleaf-cli",
+    "latex",
+    "latex-cli",
+    "cli",
+    "command-line",
+    "sync",
+    "tex",
+    "pdf",
+    "academic",
+    "writing",
+    "latex-editor",
+    "overleaf-sync",
+    "research",
+    "compile",
+    "arxiv",
+    "terminal",
+    "typescript",
+    "latex-tools"
+  ],
+  "author": "Alexander Loth <alex@alexloth.com> (https://alexloth.com)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aloth/olcli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aloth/olcli/issues"
+  },
+  "homepage": "https://github.com/aloth/olcli#readme",
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "chalk": "^5.3.0",
+    "cheerio": "^1.0.0",
+    "commander": "^12.1.0",
+    "conf": "^13.0.0",
+    "ignore": "^7.0.5",
+    "ora": "^8.0.1",
+    "tough-cookie": "^4.1.4"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^22.0.0",
+    "@types/tough-cookie": "^4.0.5",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}

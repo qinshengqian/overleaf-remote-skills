@@ -1,0 +1,4 @@
+interface:
+  display_name: "Overleaf Remote"
+  short_description: "Directly edit and manage Overleaf projects remotely"
+  default_prompt: "Use $overleaf-remote to set up olcli and manage my Overleaf project without local sync."
