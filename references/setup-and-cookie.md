@@ -102,12 +102,16 @@ https://www.overleaf.com → overleaf_session2 → Value**.
 
 ### Safari
 
+Safari uses **Command–Option–I** (`⌘⌥I`), the same shortcut as Chrome on Mac.
+If it does not open Web Inspector, enable the developer features first:
+
 1. Open **Safari → Settings** (older macOS: **Preferences**) → **Advanced**.
 2. Enable **Show features for web developers** or **Show Develop menu in menu
    bar**, depending on the Safari version.
-3. Return to Overleaf and press **Command–Option–I**, or use **Develop → Show
+3. Return to Overleaf and press **Command–Option–I** (`⌘⌥I`), or use **Develop → Show
    Web Inspector**.
-4. Select **Storage → Cookies → www.overleaf.com**.
+4. Select the **Storage** tab, expand **Cookies** in the left sidebar, and
+   select `www.overleaf.com`.
 5. Locate `overleaf_session2` and copy its Value with **Command–C**.
 
 ## 5. Obtain the cookie on Windows

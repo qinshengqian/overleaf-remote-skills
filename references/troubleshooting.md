@@ -22,7 +22,10 @@ Stop after repeated failures and ask the user to refresh the browser session.
 
 - macOS Chrome/Edge/Firefox: **Command–Option–I**.
 - Windows Chrome/Edge/Firefox: **F12**, **Fn–F12**, or **Ctrl–Shift–I**.
-- Safari: enable the Develop menu in **Safari → Settings → Advanced**.
+- Safari: in **Safari → Settings → Advanced**, enable **Show features for web
+  developers** (older versions: **Show Develop menu in menu bar**), then press
+  **Command–Option–I** (`⌘⌥I`). See the
+  [Safari cookie steps](setup-and-cookie.md#safari).
 - Do not bypass policy on a managed device where DevTools is disabled.
 
 ## Project or path not found

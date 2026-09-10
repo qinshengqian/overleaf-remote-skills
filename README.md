@@ -53,6 +53,11 @@ For browser-specific instructions—including the exact macOS and Windows keys
 used to locate `overleaf_session2`—read
 [`references/setup-and-cookie.md`](references/setup-and-cookie.md).
 
+> **Safari on Mac:** Use **Command–Option–I** (`⌘⌥I`), the same shortcut as
+> Chrome. First enable **Safari → Settings → Advanced → Show features for web
+> developers**. Then open **Storage → Cookies** in Web Inspector. See the
+> [Safari cookie steps](references/setup-and-cookie.md#safari) for details.
+
 ## Quick examples
 
 ```bash
