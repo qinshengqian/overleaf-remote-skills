@@ -2,8 +2,10 @@
 node_modules/
 *.log
 .olauth
+**/.olauth
 .olcli.json
 .env
 .env.*
 overleaf_session*
 assets/olcli/node_modules/
+assets/olcli/*.tgz

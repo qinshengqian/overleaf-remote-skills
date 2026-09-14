@@ -103,7 +103,7 @@ Get your session cookie from Overleaf.com:
 Store it with olcli:
 
 ```bash
-olcli auth --cookie "your_session_cookie_value"
+printf '%s' "$OVERLEAF_SESSION" | olcli auth --stdin
 ```
 
 **Tip:** The cookie stays valid for weeks. Just refresh it when authentication fails.
@@ -212,10 +212,10 @@ first anchor by default; use `--occurrence 2` for a later exact occurrence.
 
 ### Persistent low-latency mode
 
-`live` authenticates and downloads the project snapshot once, keeps the HTTP
-connection, file contents, and folder IDs in memory, then accepts one JSON
-object per line. Writes skip the full download verification by default and
-return their measured `elapsedMs`.
+`live` opens one collaboration WebSocket, joins text documents lazily, and
+sends compact versioned OT changes rather than downloading a project snapshot
+or uploading the whole document. It accepts one JSON object per line and
+returns the selected `transport` plus measured `elapsedMs`.
 
 ```bash
 olcli live "My Thesis"
@@ -228,9 +228,10 @@ olcli live "My Thesis"
 {"op":"quit"}
 ```
 
-Start with `--verify` when every write must be downloaded and checked; this is
-safer but intentionally slower. Use `refresh` when collaborators changed the
-project after the live session started.
+Every OT write waits for Overleaf's versioned apply acknowledgement. Add
+`--verify` for an extra document rejoin and exact comparison. Use
+`--transport ot` to require OT, `--transport http` for compatibility testing,
+and `refresh` to force joined documents to reload.
 
 ## Use Cases
 
@@ -271,7 +272,7 @@ Integrate Overleaf compilation into CI/CD:
 
 ```bash
 #!/bin/bash
-olcli auth --cookie "$OVERLEAF_SESSION"
+printf '%s' "$OVERLEAF_SESSION" | olcli auth --stdin
 olcli pull "Automated Report"
 ./generate-data.py > tables/results.tex
 olcli push

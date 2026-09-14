@@ -1,6 +1,6 @@
 {
   "name": "@aloth/olcli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Command-line interface for Overleaf — Sync, manage, and compile LaTeX projects from your terminal",
   "type": "module",
   "bin": {
@@ -9,7 +9,10 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
-    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit",
+    "lint": "npm run typecheck",
+    "test": "tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test",
     "prepare": "npm run build"
   },
   "keywords": [
@@ -44,24 +47,29 @@
   },
   "homepage": "https://github.com/aloth/olcli#readme",
   "dependencies": {
-    "adm-zip": "^0.5.16",
+    "adm-zip": "^0.6.1",
     "chalk": "^5.3.0",
-    "cheerio": "^1.0.0",
+    "cheerio": "1.0.0",
     "commander": "^12.1.0",
     "conf": "^13.0.0",
     "ignore": "^7.0.5",
     "ora": "^8.0.1",
-    "tough-cookie": "^4.1.4"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
     "@types/node": "^22.0.0",
-    "@types/tough-cookie": "^4.0.5",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
   },
+  "overrides": {
+    "ajv": "^8.18.0",
+    "fast-uri": "^3.1.6",
+    "undici": "^6.28.1"
+  },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.17"
   },
   "files": [
     "dist",

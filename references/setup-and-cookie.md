@@ -12,10 +12,10 @@ to access the Overleaf account and its projects until the session expires.
 - If exposed, sign out of Overleaf sessions and sign back in for a new cookie.
 - The bundled Skill contains no user cookie.
 
-## 2. Install Node.js 18 or newer
+## 2. Install Node.js 18.17 or newer
 
 Check first with `node --version` and `npm --version`. The Node major version
-must be 18 or greater.
+must be 18.17 or greater.
 
 ### macOS
 
@@ -146,7 +146,7 @@ Press **F12** or **Ctrl–Shift–I**, select **Storage** from `»` if hidden, e
 ```bash
 read -s "OVERLEAF_COOKIE?Paste Overleaf cookie, then press Return: "
 echo
-olcli auth --cookie "$OVERLEAF_COOKIE"
+printf '%s' "$OVERLEAF_COOKIE" | olcli auth --stdin
 unset OVERLEAF_COOKIE
 ```
 
@@ -158,7 +158,7 @@ while the secret is entered.
 ```powershell
 $SecureCookie = Read-Host 'Paste Overleaf cookie, then press Enter' -AsSecureString
 $OverleafCookie = [Net.NetworkCredential]::new('', $SecureCookie).Password
-olcli auth --cookie $OverleafCookie
+$OverleafCookie | olcli auth --stdin
 $OverleafCookie = $null
 $SecureCookie = $null
 ```

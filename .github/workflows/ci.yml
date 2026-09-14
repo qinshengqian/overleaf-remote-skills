@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  olcli:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [18, 22]
+    defaults:
+      run:
+        working-directory: assets/olcli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: assets/olcli/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - name: Ensure bundled dist is current
+        run: git diff --exit-code -- dist

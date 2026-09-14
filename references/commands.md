@@ -142,6 +142,11 @@ Start one authenticated process:
 olcli live "My Paper"
 ```
 
+The default `auto` transport opens Overleaf's collaboration WebSocket and uses
+versioned OT changes. It does not download the project ZIP. Use
+`--transport ot` to require this path, or `--transport http` for an older
+self-hosted deployment.
+
 It prints a `{"status":"ready",...}` line, then accepts one JSON object per
 line. Keep the process open and send operations through the same standard input:
 
@@ -161,10 +166,11 @@ line. Keep the process open and send operations through the same standard input:
 {"op":"quit"}
 ```
 
-Responses include `status` and `elapsedMs`. Default live writes update the
-in-memory snapshot after one upload request and do not redownload the project.
-Start with `olcli live "My Paper" --verify` for a full download comparison after
-every text write; expect it to be slower. Send `refresh` before the next edit if
-another collaborator changed files while the session was open. Operations are
-processed sequentially, so do not send a second command until the previous JSON
-response arrives.
+Responses include `status`, `transport`, `verified`, and `elapsedMs`. Existing
+documents are joined lazily; later edits send only a compact insert/delete
+delta and wait for Overleaf's versioned apply acknowledgement. Collaborator
+updates are applied in order, and a concurrent-write race forces an
+authoritative rejoin. `--verify` performs an extra rejoin and exact comparison.
+`refresh` marks joined documents stale so the next access reloads them.
+Operations are processed sequentially, so wait for each JSON response before
+sending the next command.

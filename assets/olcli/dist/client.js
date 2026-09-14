@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as https from 'node:https';
 import * as http from 'node:http';
+import { OverleafRealtimeSession } from './realtime.js';
 // Read version from package.json
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf-8'));
@@ -21,6 +22,8 @@ export class OverleafClient {
     baseUrl;
     httpAgent = new http.Agent({ keepAlive: true });
     httpsAgent = new https.Agent({ keepAlive: true });
+    prefetchedProjectsHtml;
+    projectInfoCache = new Map();
     constructor(credentials) {
         this.cookies = credentials.cookies;
         this.csrf = credentials.csrf;
@@ -110,7 +113,15 @@ export class OverleafClient {
         }
         // Update cookies if the bootstrap request added anything
         const updatedCookies = bootstrapClient.cookies;
-        return new OverleafClient({ cookies: updatedCookies, csrf, baseUrl });
+        const client = new OverleafClient({ cookies: updatedCookies, csrf, baseUrl });
+        // The bootstrap page is the same page listProjects() would immediately
+        // fetch again. Reuse it for this short-lived client process.
+        client.prefetchedProjectsHtml = html;
+        return client;
+    }
+    /** Open one persistent collaboration connection for low-latency OT edits. */
+    async openRealtimeSession(projectId) {
+        return OverleafRealtimeSession.connect(this.baseUrl, projectId, this.getCookieHeader());
     }
     getCookieHeader() {
         return Object.entries(this.cookies).map(([k, v]) => `${k}=${v}`).join('; ');
@@ -222,15 +233,19 @@ export class OverleafClient {
      * Get all projects (not archived, not trashed)
      */
     async listProjects() {
-        const response = await this.httpRequest(this.projectUrl(), {
-            headers: this.getHeaders(),
-            expect: 'text'
-        });
-        if (!response.ok) {
-            throw new Error(`Failed to fetch projects: ${response.status}`);
+        let html = this.prefetchedProjectsHtml;
+        this.prefetchedProjectsHtml = undefined;
+        if (html === undefined) {
+            const response = await this.httpRequest(this.projectUrl(), {
+                headers: this.getHeaders(),
+                expect: 'text'
+            });
+            if (!response.ok) {
+                throw new Error(`Failed to fetch projects: ${response.status}`);
+            }
+            this.applySetCookieHeaders(response.headers['set-cookie']);
+            html = response.body;
         }
-        this.applySetCookieHeaders(response.headers['set-cookie']);
-        const html = response.body;
         const $ = cheerio.load(html);
         // Try new Overleaf structure first (PR #82)
         let projectsData = [];
@@ -307,6 +322,9 @@ export class OverleafClient {
      * Get detailed project info including file tree
      */
     async getProjectInfo(projectId) {
+        const cached = this.projectInfoCache.get(projectId);
+        if (cached)
+            return cached;
         const response = await this.httpRequest(`${this.projectUrl()}/${projectId}`, {
             headers: this.getHeaders(),
             expect: 'text'
@@ -357,7 +375,11 @@ export class OverleafClient {
         if (!projectInfo) {
             throw new Error('Could not parse project info');
         }
+        this.projectInfoCache.set(projectId, projectInfo);
         return projectInfo;
+    }
+    invalidateProjectInfo(projectId) {
+        this.projectInfoCache.delete(projectId);
     }
     /**
      * Fetch the full project object via the collaboration socket.
@@ -531,6 +553,7 @@ export class OverleafClient {
         }
         this.applySetCookieHeaders(response.headers['set-cookie']);
         const data = response.body;
+        this.invalidateProjectInfo(projectId);
         return data._id;
     }
     /**
@@ -620,6 +643,35 @@ export class OverleafClient {
         catch {
             return null;
         }
+    }
+    folderTreeFromProjectInfo(projectInfo) {
+        const root = projectInfo.rootFolder?.[0];
+        if (!root?._id)
+            return null;
+        const tree = {};
+        const walk = (folder, currentPath) => {
+            tree[currentPath] = folder._id;
+            for (const child of folder.folders || []) {
+                walk(child, currentPath ? `${currentPath}/${child.name}` : child.name);
+            }
+        };
+        walk(root, '');
+        return tree;
+    }
+    /** Load the project tree once and reuse it for every upload in an operation. */
+    async getFolderTree(projectId) {
+        try {
+            const tree = this.folderTreeFromProjectInfo(await this.getProjectInfo(projectId));
+            if (tree)
+                return tree;
+        }
+        catch {
+            // The socket-only fallback below supports older/self-hosted deployments.
+        }
+        const tree = await this.getFolderTreeFromSocket(projectId);
+        if (!tree)
+            throw new Error('Could not load the remote folder tree');
+        return tree;
     }
     /**
      * main problem to resolve root folder ID from Overleaf's collaboration join payload
@@ -848,9 +900,7 @@ export class OverleafClient {
         const normalized = folderPath.replace(/^\/+|\/+$/g, '');
         if (!normalized)
             throw new Error('Folder path must not be empty');
-        const folderTree = await this.getFolderTreeFromSocket(projectId);
-        if (!folderTree)
-            throw new Error('Could not load the remote folder tree');
+        const folderTree = await this.getFolderTree(projectId);
         return this.resolveFolderId(projectId, folderTree, normalized);
     }
     /**
@@ -948,8 +998,12 @@ export class OverleafClient {
         // Resolve target folder: if fileName has a directory part and we have a folderTree, use it
         const dirPart = fileName.includes('/') ? fileName.split('/').slice(0, -1).join('/') : '';
         let targetFolderId;
-        if (dirPart && folderTree) {
-            targetFolderId = await this.resolveFolderId(projectId, folderTree, dirPart);
+        if (folderTree) {
+            targetFolderId = dirPart
+                ? await this.resolveFolderId(projectId, folderTree, dirPart)
+                : folderTree[''];
+            if (!targetFolderId)
+                targetFolderId = folderId || await this.getRootFolderId(projectId);
         }
         else {
             targetFolderId = folderId || await this.getRootFolderId(projectId);
@@ -1017,14 +1071,24 @@ export class OverleafClient {
         let result = await tryUpload(targetFolderId);
         // If cached folder ID is stale, re-resolve root folder ID and retry once.
         if (!result.success && result.error === 'folder_not_found') {
-            const refreshedRootFolderId = await this.getRootFolderId(projectId);
-            if (refreshedRootFolderId !== targetFolderId) {
-                targetFolderId = refreshedRootFolderId;
+            this.invalidateProjectInfo(projectId);
+            let refreshedFolderId;
+            if (dirPart && folderTree) {
+                const freshTree = await this.getFolderTree(projectId);
+                Object.assign(folderTree, freshTree);
+                refreshedFolderId = await this.resolveFolderId(projectId, folderTree, dirPart);
+            }
+            else {
+                refreshedFolderId = await this.getRootFolderId(projectId);
+            }
+            if (refreshedFolderId !== targetFolderId) {
+                targetFolderId = refreshedFolderId;
                 result = await tryUpload(targetFolderId);
             }
         }
-        // If folder is still unresolved, probe for a valid root folder ID
-        if (!result.success && result.error === 'folder_not_found') {
+        // Root-folder probing must never be used for a nested path: that could
+        // report success while silently flattening the file into the root.
+        if (!dirPart && !result.success && result.error === 'folder_not_found') {
             const probedFolderId = await this.probeRootFolderId(projectId);
             if (probedFolderId && probedFolderId !== targetFolderId) {
                 targetFolderId = probedFolderId;
@@ -1034,6 +1098,7 @@ export class OverleafClient {
         if (!result.success) {
             throw new Error(`Failed to upload file: ${result.error || 'unknown error'}`);
         }
+        this.invalidateProjectInfo(projectId);
         return {
             success: result.success,
             entityId: result.entityId,
@@ -1054,6 +1119,7 @@ export class OverleafClient {
             throw new Error(`Failed to delete entity: ${response.status}`);
         }
         this.applySetCookieHeaders(response.headers['set-cookie']);
+        this.invalidateProjectInfo(projectId);
     }
     /**
      * Get list of entities (files/docs) with paths
@@ -1112,20 +1178,35 @@ export class OverleafClient {
      * Download a single file by ID
      */
     async downloadFile(projectId, fileId, fileType) {
-        const endpoint = fileType === 'doc' ? 'doc' : 'file';
-        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/${endpoint}/${fileId}`, {
+        // The authenticated browser route for documents includes /download. The
+        // shorter /project/:id/doc/:id path is Overleaf's private API and returns
+        // 404 (or an HTML response) for a normal session cookie.
+        const url = fileType === 'doc'
+            ? `${this.baseUrl}/Project/${projectId}/doc/${fileId}/download`
+            : `${this.baseUrl}/Project/${projectId}/file/${fileId}`;
+        const response = await this.httpRequest(url, {
             headers: this.getHeaders(),
-            expect: fileType === 'doc' ? 'json' : 'buffer'
+            // overleaf.com currently returns document bodies as plain text, while
+            // older/self-hosted versions may return { lines: [...] } JSON.
+            expect: 'buffer'
         });
         if (!response.ok) {
             throw new Error(`Failed to download file: ${response.status}`);
         }
         this.applySetCookieHeaders(response.headers['set-cookie']);
         if (fileType === 'doc') {
-            // Docs return JSON with lines array
-            const data = response.body;
-            const content = (data.lines || []).join('\n');
-            return Buffer.from(content, 'utf-8');
+            const body = response.body;
+            const text = body.toString('utf-8');
+            try {
+                const data = JSON.parse(text);
+                if (Array.isArray(data?.lines)) {
+                    return Buffer.from(data.lines.join('\n'), 'utf-8');
+                }
+            }
+            catch {
+                // Plain text is the current overleaf.com response format.
+            }
+            return body;
         }
         else {
             return response.body;
@@ -1146,11 +1227,14 @@ export class OverleafClient {
             throw new Error(`Remote edit only supports text documents: ${path}`);
         }
         const normalized = content.replace(/\r\n/g, '\n');
-        const folderTree = await this.getFolderTreeFromSocket(projectId);
-        await this.uploadFile(projectId, null, path, Buffer.from(normalized, 'utf-8'), folderTree || undefined);
-        // downloadByPath falls back to the project archive on deployments whose
-        // direct doc endpoint does not return JSON.
-        const saved = await this.downloadByPath(projectId, path);
+        const folderTree = await this.getFolderTree(projectId);
+        const result = await this.uploadFile(projectId, null, path, Buffer.from(normalized, 'utf-8'), folderTree);
+        if (result.entityType && result.entityType !== 'doc') {
+            throw new Error(`Overleaf replaced the text document with an unexpected ${result.entityType} entity`);
+        }
+        // Verify via one direct document request. If an older deployment omits the
+        // replacement entity id, the existing id remains the best direct target.
+        const saved = await this.downloadFile(projectId, result.entityId || entity.id, result.entityType === 'file' ? 'file' : 'doc');
         if (saved.toString('utf-8') !== normalized) {
             throw new Error('Remote edit returned success but verification did not match');
         }
@@ -1163,7 +1247,7 @@ export class OverleafClient {
         if (entity.type !== 'doc') {
             throw new Error(`Remote text operations only support documents: ${path}`);
         }
-        return (await this.downloadByPath(projectId, path)).toString('utf-8');
+        return (await this.downloadFile(projectId, entity.id, 'doc')).toString('utf-8');
     }
     /**
      * Rename a file, doc, or folder
@@ -1179,6 +1263,7 @@ export class OverleafClient {
             throw new Error(`Failed to rename entity: ${response.status}`);
         }
         this.applySetCookieHeaders(response.headers['set-cookie']);
+        this.invalidateProjectInfo(projectId);
     }
     /**
      * Delete a file by path
@@ -1205,19 +1290,15 @@ export class OverleafClient {
      */
     async downloadByPath(projectId, path) {
         const normalizedPath = path.replace(/^\//, '');
-        // First check if file exists
-        const entities = await this.getEntities(projectId);
-        const entityExists = entities.find(e => e.path.replace(/^\//, '') === normalizedPath ||
-            e.path === `/${normalizedPath}`);
-        if (!entityExists) {
+        const entity = await this.findEntityByPath(projectId, path);
+        if (!entity)
             throw new Error(`File not found: ${path}`);
-        }
-        // Try to find entity with ID for direct download
+        if (entity.type === 'folder')
+            throw new Error(`Path is a folder: ${path}`);
+        // Prefer a small direct request. Use the ZIP only when an older deployment
+        // does not support the direct entity endpoint.
         try {
-            const entity = await this.findEntityByPath(projectId, path);
-            if (entity && entity.type !== 'folder') {
-                return await this.downloadFile(projectId, entity.id, entity.type);
-            }
+            return await this.downloadFile(projectId, entity.id, entity.type);
         }
         catch (e) {
             // Fall through to zip method

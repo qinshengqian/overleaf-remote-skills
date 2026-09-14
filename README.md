@@ -12,12 +12,12 @@ projects directly—without maintaining a continuous local pull/push checkout.
 - Upload images, PDFs, bibliographies, and other assets to remote paths
 - Compile projects and download PDFs, logs, and BBL files
 - Verify saved text and important binary uploads
-- Keep a persistent low-latency `olcli live` session open for repeated edits
+- Keep a persistent versioned WebSocket/OT session open for repeated edits
 - Detailed macOS and Windows setup and Cookie instructions
 
-In real Overleaf tests, persistent edits completed in roughly 1.8 seconds per
-write, compared with about 12 seconds for the original full read/write/verify
-path. Actual latency depends on network and Overleaf service conditions.
+The default direct-edit commands try a compact, versioned OT update first and
+fall back to verified HTTP replacement only when it is safe. Persistent mode
+avoids the old whole-project ZIP startup and reuses one collaboration socket.
 
 ## Repository layout
 
@@ -33,7 +33,7 @@ assets/olcli/                  Bundled enhanced olcli source and build
 
 ## Install the bundled olcli
 
-Node.js 18 or newer is required.
+Node.js 18.17 or newer is required.
 
 macOS/Linux:
 
@@ -73,6 +73,8 @@ Persistent mode accepts one JSON object per line:
 
 ```bash
 olcli live "My Paper"
+# Require the fast path (fail instead of falling back):
+olcli live "My Paper" --transport ot
 ```
 
 ```json

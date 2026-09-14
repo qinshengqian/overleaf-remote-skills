@@ -2,7 +2,7 @@
  * Configuration management for olcli
  */
 import Conf from 'conf';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const config = new Conf({
     projectName: 'olcli',
@@ -42,7 +42,7 @@ export function getSessionCookie() {
                 const cookieName = getSessionCookieName();
                 const sessionCookie = cookies.find(c => c.startsWith(`${cookieName}=`));
                 if (sessionCookie) {
-                    return sessionCookie.split('=')[1];
+                    return sessionCookie.slice(sessionCookie.indexOf('=') + 1);
                 }
             }
             return content;
@@ -56,6 +56,10 @@ export function getSessionCookie() {
 }
 export function setSessionCookie(cookie) {
     config.set('sessionCookie', cookie);
+    try {
+        chmodSync(config.path, 0o600);
+    }
+    catch { /* Best effort on non-POSIX systems. */ }
 }
 export function getCsrf() {
     return config.get('csrf');
@@ -80,6 +84,10 @@ export function getConfigPath() {
  */
 export function saveOlAuth(cookie, path) {
     const authPath = path || join(process.cwd(), '.olauth');
-    writeFileSync(authPath, `${getSessionCookieName()}=${cookie}`, 'utf-8');
+    writeFileSync(authPath, `${getSessionCookieName()}=${cookie}`, { encoding: 'utf-8', mode: 0o600 });
+    try {
+        chmodSync(authPath, 0o600);
+    }
+    catch { /* Best effort on non-POSIX systems. */ }
 }
 //# sourceMappingURL=config.js.map

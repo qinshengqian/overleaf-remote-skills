@@ -47,9 +47,19 @@ permission. Do not repeatedly create folders without inspecting remote state.
 
 ## Verify uploaded content
 
-Text commands perform read-after-write verification. For binary files, download
+Text commands require a versioned OT acknowledgement, or perform HTTP
+read-after-write verification when OT is unavailable. For binary files, download
 to a temporary path and compare with `cmp` on macOS/Linux or `Get-FileHash` on
 Windows.
+
+## Realtime transport is unavailable
+
+`olcli live` reports its selected `transport` in the ready response. `auto`
+falls back to HTTP for handshake, document-type, or size failures that occur
+before sending an update. Use `--transport ot` to expose the underlying error.
+An error after an update was sent is intentionally not retried because the
+server outcome may be uncertain; issue `refresh`, inspect the document, and
+then decide whether to repeat the edit.
 
 ## Compile failed
 

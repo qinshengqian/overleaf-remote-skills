@@ -13,6 +13,7 @@ import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { OverleafClient } from './client.js';
+import { RealtimeUnavailableError } from './realtime.js';
 import { loadIgnore, shouldIgnore, buildTexSiblingSet, } from './ignore.js';
 // Read version from package.json
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -27,6 +28,25 @@ async function readStdin() {
     }
     return Buffer.concat(chunks).toString('utf-8');
 }
+async function mapLimit(items, limit, worker) {
+    let cursor = 0;
+    const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (cursor < items.length) {
+            const item = items[cursor++];
+            await worker(item);
+        }
+    });
+    await Promise.all(runners);
+}
+async function prepareUploadFolders(client, projectId, folderTree, paths) {
+    const directories = Array.from(new Set(paths
+        .map(path => path.includes('/') ? path.split('/').slice(0, -1).join('/') : '')
+        .filter(Boolean)))
+        .sort((a, b) => a.split('/').length - b.split('/').length);
+    for (const directory of directories) {
+        await client.resolveFolderId(projectId, folderTree, directory);
+    }
+}
 program
     .name('olcli')
     .description('Overleaf CLI - interact with Overleaf projects from the command line')
@@ -40,7 +60,7 @@ async function getClient(cookieOpt, baseUrlOpt) {
     const cookie = cookieOpt || getSessionCookie();
     if (!cookie) {
         console.error(chalk.red('No session cookie found.'));
-        console.error('Set one with: olcli auth --cookie <session_cookie>');
+        console.error('Set one securely with: olcli auth --stdin');
         console.error('Or set OVERLEAF_SESSION environment variable');
         console.error('Or create .olauth file in current directory');
         process.exit(1);
@@ -76,6 +96,26 @@ async function resolveProject(client, projectArg, dir = '.') {
     throw new Error('No project specified. Provide a project name/ID or run from a synced directory.');
 }
 async function transformRemoteDocument(client, projectId, file, transform) {
+    let realtime;
+    try {
+        realtime = await client.openRealtimeSession(projectId);
+        await realtime.mutate(file, transform, true);
+        return;
+    }
+    catch (error) {
+        // Connection/join/size failures occur before an OT update is sent and are
+        // safe to retry through the conservative HTTP replacement path. Never
+        // retry an uncertain in-flight write, which could duplicate an insertion.
+        if (realtime && (!(error instanceof RealtimeUnavailableError) || !error.safeToFallback)) {
+            throw error;
+        }
+    }
+    finally {
+        realtime?.close();
+    }
+    await transformRemoteDocumentHttp(client, projectId, file, transform);
+}
+async function transformRemoteDocumentHttp(client, projectId, file, transform) {
     const current = await client.readDocumentByPath(projectId, file);
     const updated = transform(current);
     if (updated === current)
@@ -89,9 +129,15 @@ program
     .command('auth')
     .description('Authenticate with Overleaf using session cookie')
     .option('--cookie <session>', 'Session cookie (overleaf_session2 value)')
+    .option('--stdin', 'Read the session cookie from standard input (recommended)')
     .option('--save-local', 'Save to .olauth in current directory')
     .action(async (options) => {
-    if (!options.cookie) {
+    if (options.cookie && options.stdin) {
+        console.error(chalk.red('Choose only one credential source: --cookie or --stdin'));
+        process.exit(1);
+    }
+    const suppliedCookie = options.stdin ? (await readStdin()).trim() : options.cookie;
+    if (!suppliedCookie) {
         console.log(chalk.yellow('To authenticate, provide your session cookie:'));
         console.log();
         console.log('1. Log into overleaf.com in your browser');
@@ -99,7 +145,7 @@ program
         console.log('3. Find the cookie named "overleaf_session2"');
         console.log('4. Copy its value and run:');
         console.log();
-        console.log(chalk.cyan('  olcli auth --cookie "your_session_cookie_value"'));
+        console.log(chalk.cyan("  printf '%s' \"$OVERLEAF_SESSION\" | olcli auth --stdin"));
         console.log();
         console.log('Or set OVERLEAF_SESSION environment variable');
         return;
@@ -108,11 +154,11 @@ program
     try {
         const baseUrl = program.opts().baseUrl || getBaseUrl();
         const cookieName = program.opts().cookieName || getSessionCookieName();
-        const client = await OverleafClient.fromSessionCookie(options.cookie, baseUrl, cookieName);
+        const client = await OverleafClient.fromSessionCookie(suppliedCookie, baseUrl, cookieName);
         const projects = await client.listProjects();
-        setSessionCookie(options.cookie);
+        setSessionCookie(suppliedCookie);
         if (options.saveLocal) {
-            saveOlAuth(options.cookie);
+            saveOlAuth(suppliedCookie);
             spinner.succeed(`Authenticated! Found ${projects.length} projects. Saved to .olauth`);
         }
         else {
@@ -572,12 +618,10 @@ program
         if (existing) {
             if (existing.type !== 'doc')
                 throw new Error(`Cannot replace binary file with write: ${file}`);
-            await client.updateDocumentByPath(proj.id, file, content);
+            await transformRemoteDocument(client, proj.id, file, () => content);
         }
         else {
-            const folderTree = await client.getFolderTreeFromSocket(proj.id);
-            if (!folderTree)
-                throw new Error('Could not load the remote folder tree');
+            const folderTree = await client.getFolderTree(proj.id);
             await client.uploadFile(proj.id, null, file, Buffer.from(content, 'utf-8'), folderTree);
             const saved = await client.downloadByPath(proj.id, file);
             if (saved.toString('utf-8') !== content.replace(/\r\n/g, '\n')) {
@@ -594,59 +638,92 @@ program
 });
 program
     .command('live [project]')
-    .description('Keep one authenticated process open for low-latency remote edits')
-    .option('--verify', 'Download and verify after every write (slower)')
+    .description('Keep one authenticated OT connection open for low-latency remote edits')
+    .option('--verify', 'Rejoin and compare the document after every OT write')
+    .option('--transport <mode>', 'Transport: auto, ot, or http', 'auto')
     .option('--cookie <session>', 'Session cookie override')
     .action(async (project, options) => {
     const spinner = ora('Starting persistent Overleaf session...').start();
     try {
-        let client;
-        let lastConnectError;
-        for (let attempt = 0; attempt < 3; attempt++) {
+        if (!['auto', 'ot', 'http'].includes(options.transport)) {
+            throw new Error('--transport must be auto, ot, or http');
+        }
+        const client = await getClient(options.cookie);
+        const proj = await resolveProject(client, project);
+        let realtime;
+        let transport = 'http';
+        let fallbackReason;
+        if (options.transport !== 'http') {
             try {
-                client = await getClient(options.cookie);
-                break;
+                realtime = await client.openRealtimeSession(proj.id);
+                transport = 'ot';
             }
             catch (error) {
-                lastConnectError = error;
+                if (options.transport === 'ot')
+                    throw error;
+                fallbackReason = error.message || String(error);
             }
         }
-        if (!client)
-            throw lastConnectError || new Error('Could not connect to Overleaf');
-        const proj = await resolveProject(client, project);
-        // Start immediately with the conventional root ID. uploadFile() already
-        // has authoritative socket/probe fallbacks if a deployment uses a
-        // different root, so live startup should not block on socket polling.
-        let folderTree = { '': client.computeRootFolderId(proj.id) };
-        const loadSnapshot = async () => {
-            let lastError;
-            for (let attempt = 0; attempt < 3; attempt++) {
-                try {
-                    const archive = await client.downloadProject(proj.id);
-                    const AdmZip = (await import('adm-zip')).default;
-                    const zip = new AdmZip(archive);
-                    const snapshot = new Map();
-                    for (const entry of zip.getEntries()) {
-                        if (!entry.isDirectory)
-                            snapshot.set(entry.entryName, entry.getData());
-                    }
-                    return snapshot;
-                }
-                catch (error) {
-                    lastError = error;
-                }
-            }
-            throw lastError || new Error('Could not download project snapshot');
+        let folderTree;
+        const getFolderTree = async () => {
+            folderTree ||= await client.getFolderTree(proj.id);
+            return folderTree;
         };
-        let files = await loadSnapshot();
         spinner.stop();
         console.log(JSON.stringify({
             status: 'ready',
             projectId: proj.id,
             projectName: proj.name,
-            files: files.size,
-            verify: options.verify === true
+            transport,
+            protocolVersion: realtime?.sessionInfo.protocolVersion,
+            documents: realtime?.sessionInfo.documents,
+            files: realtime ? realtime.sessionInfo.documents + realtime.sessionInfo.files : undefined,
+            verify: options.verify === true,
+            fallbackReason,
         }));
+        const buildTransform = (op, command) => (existing) => {
+            if (op === 'write') {
+                if (typeof command.content !== 'string')
+                    throw new Error('write requires content');
+                return command.content;
+            }
+            if (op === 'replace') {
+                if (typeof command.search !== 'string' || command.search.length === 0)
+                    throw new Error('replace requires non-empty search');
+                if (typeof command.replacement !== 'string')
+                    throw new Error('replace requires replacement');
+                const matches = existing.split(command.search).length - 1;
+                if (matches === 0)
+                    throw new Error('Search text was not found');
+                if (command.all !== true && matches !== 1)
+                    throw new Error(`Search text matched ${matches} times; use a more specific search or all:true`);
+                return command.all === true
+                    ? existing.split(command.search).join(command.replacement)
+                    : existing.replace(command.search, command.replacement);
+            }
+            if (op === 'insert') {
+                if (typeof command.anchor !== 'string' || command.anchor.length === 0)
+                    throw new Error('insert requires non-empty anchor');
+                if (typeof command.text !== 'string')
+                    throw new Error('insert requires text');
+                const occurrence = command.occurrence === undefined ? 1 : Number(command.occurrence);
+                if (!Number.isInteger(occurrence) || occurrence < 1)
+                    throw new Error('occurrence must be a positive integer');
+                let index = -1;
+                let from = 0;
+                for (let i = 0; i < occurrence; i++) {
+                    index = existing.indexOf(command.anchor, from);
+                    if (index === -1)
+                        throw new Error(`Anchor occurrence ${occurrence} was not found`);
+                    from = index + command.anchor.length;
+                }
+                const position = command.before === true ? index : index + command.anchor.length;
+                return existing.slice(0, position) + command.text + existing.slice(position);
+            }
+            if (typeof command.text !== 'string')
+                throw new Error(`${op} requires text`);
+            return op === 'append' ? existing + command.text : command.text + existing;
+        };
         const rl = createInterface({ input: process.stdin, crlfDelay: Infinity, terminal: false });
         for await (const rawLine of rl) {
             const line = rawLine.trim();
@@ -657,6 +734,7 @@ program
                 const command = JSON.parse(line);
                 const op = command.op;
                 if (op === 'quit') {
+                    realtime?.close();
                     console.log(JSON.stringify({ status: 'bye' }));
                     break;
                 }
@@ -665,9 +743,9 @@ program
                     continue;
                 }
                 if (op === 'refresh') {
-                    files = await loadSnapshot();
-                    folderTree = await client.getFolderTreeFromSocket(proj.id) || folderTree;
-                    console.log(JSON.stringify({ status: 'ok', op, files: files.size, elapsedMs: Date.now() - started }));
+                    await realtime?.refresh(typeof command.path === 'string' ? command.path : undefined);
+                    folderTree = undefined;
+                    console.log(JSON.stringify({ status: 'ok', op, transport, elapsedMs: Date.now() - started }));
                     continue;
                 }
                 if (op === 'compile') {
@@ -678,7 +756,7 @@ program
                 if (op === 'mkdir') {
                     if (typeof command.path !== 'string' || !command.path)
                         throw new Error('mkdir requires path');
-                    await client.resolveFolderId(proj.id, folderTree, command.path.replace(/^\/+|\/+$/g, ''));
+                    await client.resolveFolderId(proj.id, await getFolderTree(), command.path.replace(/^\/+|\/+$/g, ''));
                     console.log(JSON.stringify({ status: 'ok', op, path: command.path, elapsedMs: Date.now() - started }));
                     continue;
                 }
@@ -687,8 +765,9 @@ program
                         throw new Error('upload requires localPath and path');
                     }
                     const data = readFileSync(command.localPath);
-                    await client.uploadFile(proj.id, null, command.path, data, folderTree);
-                    files.set(command.path, data);
+                    const result = await client.uploadFile(proj.id, null, command.path, data, await getFolderTree());
+                    if (result.entityType === 'doc' && result.entityId)
+                        realtime?.registerDocument(command.path, result.entityId);
                     console.log(JSON.stringify({ status: 'ok', op, path: command.path, bytes: data.length, elapsedMs: Date.now() - started }));
                     continue;
                 }
@@ -697,71 +776,47 @@ program
                 }
                 if (typeof command.path !== 'string' || !command.path)
                     throw new Error(`${op} requires path`);
-                const existing = files.get(command.path)?.toString('utf-8');
-                let updated;
-                if (op === 'write') {
-                    if (typeof command.content !== 'string')
-                        throw new Error('write requires content');
-                    updated = command.content;
+                const transform = buildTransform(op, command);
+                let resultTransport = transport;
+                let content;
+                if (realtime && realtime.hasDocument(command.path)) {
+                    try {
+                        const result = await realtime.mutate(command.path, transform, options.verify === true);
+                        content = result.content;
+                    }
+                    catch (error) {
+                        if (!(error instanceof RealtimeUnavailableError) || !error.safeToFallback || options.transport === 'ot')
+                            throw error;
+                        await transformRemoteDocumentHttp(client, proj.id, command.path, transform);
+                        content = await client.readDocumentByPath(proj.id, command.path);
+                        resultTransport = 'http';
+                    }
                 }
-                else {
-                    if (existing === undefined)
-                        throw new Error(`Remote text file not found in snapshot: ${command.path}`);
-                    if (op === 'replace') {
-                        if (typeof command.search !== 'string' || command.search.length === 0)
-                            throw new Error('replace requires non-empty search');
-                        if (typeof command.replacement !== 'string')
-                            throw new Error('replace requires replacement');
-                        const matches = existing.split(command.search).length - 1;
-                        if (matches === 0)
-                            throw new Error('Search text was not found');
-                        if (command.all !== true && matches !== 1)
-                            throw new Error(`Search text matched ${matches} times; use a more specific search or all:true`);
-                        updated = command.all === true
-                            ? existing.split(command.search).join(command.replacement)
-                            : existing.replace(command.search, command.replacement);
-                    }
-                    else if (op === 'insert') {
-                        if (typeof command.anchor !== 'string' || command.anchor.length === 0)
-                            throw new Error('insert requires non-empty anchor');
-                        if (typeof command.text !== 'string')
-                            throw new Error('insert requires text');
-                        const occurrence = command.occurrence === undefined ? 1 : Number(command.occurrence);
-                        if (!Number.isInteger(occurrence) || occurrence < 1)
-                            throw new Error('occurrence must be a positive integer');
-                        let index = -1;
-                        let from = 0;
-                        for (let i = 0; i < occurrence; i++) {
-                            index = existing.indexOf(command.anchor, from);
-                            if (index === -1)
-                                throw new Error(`Anchor occurrence ${occurrence} was not found`);
-                            from = index + command.anchor.length;
-                        }
-                        const position = command.before === true ? index : index + command.anchor.length;
-                        updated = existing.slice(0, position) + command.text + existing.slice(position);
-                    }
-                    else if (op === 'append') {
-                        if (typeof command.text !== 'string')
-                            throw new Error('append requires text');
-                        updated = existing + command.text;
+                else if (op === 'write') {
+                    const updated = transform('').replace(/\r\n/g, '\n');
+                    const existing = await client.findEntityByPath(proj.id, command.path);
+                    if (existing) {
+                        if (existing.type !== 'doc')
+                            throw new Error(`Cannot replace binary file: ${command.path}`);
+                        await client.updateDocumentByPath(proj.id, command.path, updated);
                     }
                     else {
-                        if (typeof command.text !== 'string')
-                            throw new Error('prepend requires text');
-                        updated = command.text + existing;
+                        const upload = await client.uploadFile(proj.id, null, command.path, Buffer.from(updated), await getFolderTree());
+                        if (upload.entityId && upload.entityType === 'doc')
+                            realtime?.registerDocument(command.path, upload.entityId);
                     }
+                    content = updated;
+                    resultTransport = 'http';
                 }
-                const normalized = updated.replace(/\r\n/g, '\n');
-                await client.uploadFile(proj.id, null, command.path, Buffer.from(normalized, 'utf-8'), folderTree);
-                files.set(command.path, Buffer.from(normalized, 'utf-8'));
-                if (options.verify) {
-                    const saved = await client.downloadByPath(proj.id, command.path);
-                    if (saved.toString('utf-8') !== normalized)
-                        throw new Error('Remote verification did not match');
+                else {
+                    await transformRemoteDocumentHttp(client, proj.id, command.path, transform);
+                    content = await client.readDocumentByPath(proj.id, command.path);
+                    resultTransport = 'http';
                 }
                 console.log(JSON.stringify({
                     status: 'ok', op, path: command.path,
-                    bytes: Buffer.byteLength(normalized), verified: options.verify === true,
+                    transport: resultTransport,
+                    bytes: Buffer.byteLength(content), verified: true,
                     elapsedMs: Date.now() - started
                 }));
             }
@@ -769,6 +824,7 @@ program
                 console.log(JSON.stringify({ status: 'error', message: error.message, elapsedMs: Date.now() - started }));
             }
         }
+        realtime?.close();
     }
     catch (error) {
         spinner.fail(`Failed: ${error.message}`);
@@ -794,10 +850,8 @@ program
         const remotePath = options.to || basename(file);
         // Pass folder ID or null for root folder (client will compute it)
         const folderId = options.folder || null;
-        const folderTree = options.folder ? undefined : await client.getFolderTreeFromSocket(proj.id);
-        if (!options.folder && !folderTree)
-            throw new Error('Could not load the remote folder tree');
-        const result = await client.uploadFile(proj.id, folderId, remotePath, content, folderTree || undefined);
+        const folderTree = options.folder ? undefined : await client.getFolderTree(proj.id);
+        const result = await client.uploadFile(proj.id, folderId, remotePath, content, folderTree);
         if (result.success) {
             spinner.succeed(`Uploaded: ${file} → ${remotePath} in "${proj.name}"`);
         }
@@ -1145,17 +1199,13 @@ program
         }
         // Fetch folder tree once so uploads go into correct subfolders
         spinner.text = 'Resolving folder structure...';
-        let folderTree = await client.getFolderTreeFromSocket(projectId);
-        if (!folderTree) {
-            // Fallback: build minimal tree with just root
-            const resolvedRootId = rootFolderId || await client.getRootFolderId(projectId);
-            folderTree = { '': resolvedRootId };
-        }
+        const folderTree = await client.getFolderTree(projectId);
+        await prepareUploadFolders(client, projectId, folderTree, filesToUpload.map(file => file.relativePath));
         spinner.text = `Uploading ${filesToUpload.length} file(s)...`;
         let uploaded = 0;
         let failed = 0;
         let folderNotFoundCount = 0;
-        for (const file of filesToUpload) {
+        await mapLimit(filesToUpload, 4, async (file) => {
             try {
                 const content = readFileSync(file.path);
                 await client.uploadFile(projectId, rootFolderId || null, file.relativePath, content, folderTree);
@@ -1169,7 +1219,7 @@ program
                     folderNotFoundCount++;
                 }
             }
-        }
+        });
         // Update last push time
         if (existsSync(metaPath)) {
             const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
@@ -1394,9 +1444,11 @@ program
         // Upload local changes
         if (filesToUpload.length > 0 && !options.dryRun) {
             spinner.text = `Uploading ${filesToUpload.length} local change(s)...`;
-            for (const file of filesToUpload) {
-                await client.uploadFile(projectId, null, file.path, file.content);
-            }
+            const folderTree = await client.getFolderTree(projectId);
+            await prepareUploadFolders(client, projectId, folderTree, filesToUpload.map(file => file.path));
+            await mapLimit(filesToUpload, 4, async (file) => {
+                await client.uploadFile(projectId, null, file.path, file.content, folderTree);
+            });
         }
         // Refresh manifest of remote files post-sync (deletions out, new uploads in)
         const newManifest = new Set(remoteFiles.keys());
@@ -1545,7 +1597,7 @@ program
     const cookie = getSessionCookie();
     if (cookie) {
         console.log(chalk.green('✓ Session cookie found'));
-        console.log(chalk.dim(`  Value: ${cookie.substring(0, 20)}...`));
+        console.log(chalk.dim('  Value: hidden (credentials are never printed)'));
     }
     else {
         console.log(chalk.yellow('✗ No session cookie found'));

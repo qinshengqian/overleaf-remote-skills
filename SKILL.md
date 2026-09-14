@@ -10,12 +10,14 @@ remote commands (`replace`, `insert`, `append`, `prepend`, `write`, `mkdir`,
 and `upload --to`) over maintaining a continuously synchronized local copy when
 the user wants changes made directly on Overleaf.
 
-For multiple edits in one working session, prefer `olcli live`: it authenticates
-and snapshots once, keeps HTTP connections and project state in memory, and
-accepts JSON-lines operations with roughly one remote write per edit. Use
-`--verify` only when per-edit download verification is worth the added latency,
-and send `refresh` before editing when collaborators changed the project after
-the session started.
+For multiple edits in one working session, prefer `olcli live`: it keeps one
+Overleaf collaboration WebSocket open, joins text documents lazily, and sends
+small versioned OT insert/delete operations instead of downloading and
+re-uploading whole files. It tracks collaborator updates and safely rejoins a
+document after a race. `auto` mode falls back to verified HTTP replacement only
+when the failure happened before an OT write was sent; uncertain writes are
+never retried blindly. Use `--transport ot` to require OT or `--transport http`
+to diagnose compatibility with older self-hosted instances.
 
 ## Route the task
 
@@ -43,7 +45,7 @@ the session started.
    `--occurrence <n>` when the anchor repeats.
 5. Use `write` to create or replace text documents, `mkdir` for folders, and
    `upload --to` for images, PDFs, bibliographies, archives, or other files.
-6. Preserve the built-in read-after-write verification. For binary uploads,
+6. Preserve the built-in versioned OT acknowledgement or HTTP read-after-write verification. For binary uploads,
    download to a temporary file and compare hashes or bytes when correctness
    matters.
 7. Do not start a pull/push daemon unless the user explicitly asks for ongoing
