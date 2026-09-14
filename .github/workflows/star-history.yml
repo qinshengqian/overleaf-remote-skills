@@ -1,0 +1,34 @@
+name: Update star history chart
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/star-history.yml
+  watch:
+    types:
+      - started
+  schedule:
+    - cron: "30 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: star-history
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Generate and commit charts
+        uses: xpzouying/star-history@8b1f26dc5e9a17caa75da9351b688509ef312811 # v1
+        with:
+          repo: ${{ github.repository }}
+          commit-message: "chore: update star history chart [skip ci]"

@@ -19,6 +19,13 @@ The default direct-edit commands try a compact, versioned OT update first and
 fall back to verified HTTP replacement only when it is safe. Persistent mode
 avoids the old whole-project ZIP startup and reuses one collaboration socket.
 
+## Star history
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history-dark.svg">
+  <img alt="Star history chart for qinshengqian/overleaf-remote-skills" src="assets/star-history.svg">
+</picture>
+
 ## Repository layout
 
 ```text
