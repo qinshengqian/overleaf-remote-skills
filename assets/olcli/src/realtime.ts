@@ -158,6 +158,8 @@ export class OverleafRealtimeSession {
   private documentIds = new Map<string, string>();
   private fileCount = 0;
   private closed = false;
+  private needsReconnect = false;
+  private reconnecting: Promise<void> | null = null;
   private operationChain: Promise<unknown> = Promise.resolve();
   private info: RealtimeSessionInfo = { documents: 0, files: 0 };
 
@@ -212,8 +214,21 @@ export class OverleafRealtimeSession {
       this.socket = socket;
       socket.once('open', resolve);
       socket.once('error', reject);
-      socket.on('message', data => this.handleMessage(data.toString()));
-      socket.on('close', () => this.handleClose(new RealtimeUnavailableError('Realtime connection closed')));
+      // A socket we have already replaced must not be able to touch session
+      // state, otherwise a late packet from a dead connection could corrupt the
+      // live one after a reconnect.
+      const isCurrent = () => this.socket === socket;
+      socket.on('message', data => {
+        if (isCurrent()) this.handleMessage(data.toString());
+      });
+      socket.on('close', () => {
+        if (isCurrent()) this.handleClose(new RealtimeUnavailableError('Realtime connection closed'));
+      });
+      socket.on('error', error => {
+        if (isCurrent()) {
+          this.handleClose(new RealtimeUnavailableError(`Realtime connection error: ${error.message}`));
+        }
+      });
     });
     await withTimeout(connected, 'WebSocket connection timed out');
     const args = await withTimeout(projectResponse, 'Timed out waiting for joinProjectResponse');
@@ -225,6 +240,64 @@ export class OverleafRealtimeSession {
     this.info.protocolVersion = payload.protocolVersion;
     this.info.permissionsLevel = payload.permissionsLevel;
     this.indexProject(payload.project.rootFolder || []);
+  }
+
+  /**
+   * The collaboration socket can die without the process noticing: a sleeping
+   * laptop, a network switch, or an Overleaf deploy leaves it half-open, and
+   * every later operation would fail with "connection is not open" until the
+   * whole session is restarted.
+   *
+   * Reconnect lazily, at the start of an operation. An idle session then costs
+   * nothing, and a write is never retried behind the caller's back: an
+   * operation that was in flight when the socket dropped still fails, because
+   * the server may or may not have applied it.
+   */
+  private async ensureConnected(): Promise<void> {
+    if (this.closed) throw new RealtimeUnavailableError('Realtime session is closed');
+    if (!this.needsReconnect && this.socket?.readyState === WebSocket.OPEN) return;
+    await this.reconnect();
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.reconnecting) return this.reconnecting;
+    this.reconnecting = (async () => {
+      const previous = this.socket;
+      this.socket = undefined;
+      try {
+        previous?.terminate();
+      } catch {
+        // The old socket is already gone; nothing to clean up.
+      }
+      // Fail anything that was still waiting on the old connection rather than
+      // letting it hang until its own timeout.
+      const lost = new RealtimeUnavailableError('Realtime connection was lost');
+      for (const pending of this.pendingAcks.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(lost);
+      }
+      this.pendingAcks.clear();
+      for (const state of this.documents.values()) {
+        if (state.inFlight) {
+          clearTimeout(state.inFlight.timer);
+          state.inFlight.reject(lost);
+          state.inFlight = undefined;
+        }
+      }
+      // Drop the joined documents: the next access re-joins them on the new
+      // connection and picks up whatever version the server holds by then.
+      this.documents.clear();
+      this.needsReconnect = false;
+      await this.open();
+    })();
+    try {
+      await this.reconnecting;
+    } catch (error) {
+      this.needsReconnect = true;
+      throw error;
+    } finally {
+      this.reconnecting = null;
+    }
   }
 
   private indexProject(roots: FolderLike[]): void {
@@ -396,10 +469,12 @@ export class OverleafRealtimeSession {
   }
 
   async read(path: string, force = false): Promise<string> {
+    await this.ensureConnected();
     return (await this.joinDocument(path, force)).content;
   }
 
   async refresh(path?: string): Promise<void> {
+    await this.ensureConnected();
     if (path) {
       await this.joinDocument(path, true);
       return;
@@ -409,6 +484,9 @@ export class OverleafRealtimeSession {
 
   async mutate(path: string, transform: (content: string) => string, verify = false): Promise<{ content: string; version: number; verified: boolean }> {
     const run = async () => {
+      // Reconnect before reading, so the transform is computed against content
+      // the server currently holds rather than a snapshot from a dead socket.
+      await this.ensureConnected();
       const state = await this.joinDocument(path);
       const before = state.content;
       const after = transform(before).replace(/\r\n/g, '\n');
@@ -473,6 +551,7 @@ export class OverleafRealtimeSession {
 
   close(): void {
     this.closed = true;
+    this.needsReconnect = false;
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send('0::');
     this.socket?.close();
     this.handleClose(new RealtimeUnavailableError('Realtime session closed'));
@@ -481,6 +560,8 @@ export class OverleafRealtimeSession {
   private handleClose(error: Error): void {
     if (!this.closed) {
       for (const state of this.documents.values()) state.stale = true;
+      // Not an intentional shutdown, so let the next operation reconnect.
+      this.needsReconnect = true;
     }
     for (const pending of this.pendingAcks.values()) {
       clearTimeout(pending.timer);

@@ -97,3 +97,73 @@ test('speaks the Socket.IO 0.9 joinDoc/applyOtUpdate protocol', async t => {
   assert.deepEqual(receivedUpdate.op, [{ p: 1, d: 'e' }, { p: 1, i: 'a' }]);
   assert.equal(receivedUpdate.v, 3);
 });
+
+test('reconnects and re-joins after the collaboration socket drops', async t => {
+  let handshakes = 0;
+  let docVersion = 3;
+  let docLines = ['hello'];
+  let liveSocket: WebSocket | undefined;
+
+  const server = createServer((request, response) => {
+    if (request.url?.startsWith('/socket.io/1/')) {
+      handshakes++;
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      response.end(`session-${handshakes}:15:60:websocket`);
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  const websocketServer = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (request, socket, head) => {
+    websocketServer.handleUpgrade(request, socket, head, ws => websocketServer.emit('connection', ws, request));
+  });
+  websocketServer.on('connection', ws => {
+    liveSocket = ws;
+    ws.send('1::');
+    ws.send('5:::{"name":"joinProjectResponse","args":[{"protocolVersion":2,"permissionsLevel":"owner","project":{"rootFolder":[{"_id":"root","name":"root","folders":[],"docs":[{"_id":"doc-1","name":"main.tex"}],"fileRefs":[]}]}}]}');
+    ws.on('message', raw => {
+      const match = raw.toString().match(/^5:(\d+)\+::(.*)$/s);
+      if (!match) return;
+      const id = match[1];
+      const event = JSON.parse(match[2]);
+      if (event.name === 'joinDoc') {
+        ws.send(`6:::${id}+[null,${JSON.stringify(docLines)},${docVersion},[],{},"sharejs-text-ot"]`);
+      } else if (event.name === 'applyOtUpdate') {
+        const update = event.args[1];
+        docLines = [applyTextOperations(docLines.join('\n'), update.op)];
+        docVersion = update.v + 1;
+        ws.send(`6:::${id}+[null]`);
+        // The confirmation carries the version the update was applied at, which
+        // is the base version the client sent.
+        ws.send(`5:::{"name":"otUpdateApplied","args":[{"v":${update.v},"doc":"doc-1"}]}`);
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    websocketServer.close();
+    server.close();
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Mock server did not bind');
+
+  const session = await OverleafRealtimeSession.connect(
+    `http://127.0.0.1:${address.port}`,
+    '0123456789abcdef01234567',
+    'overleaf_session2=secret',
+  );
+  t.after(() => session.close());
+
+  assert.equal((await session.mutate('main.tex', text => text.replace('e', 'a'))).content, 'hallo');
+  assert.equal(handshakes, 1);
+
+  // Drop the socket the way a sleeping laptop does: no Socket.IO disconnect
+  // packet, just a connection that stops answering.
+  liveSocket?.terminate();
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  const reconnected = await session.mutate('main.tex', text => text.replace('a', 'o'));
+  assert.equal(handshakes, 2, 'the session should handshake again');
+  assert.equal(reconnected.content, 'hollo');
+  assert.equal(reconnected.version, 5, 'the re-join must use the version the server now holds');
+});

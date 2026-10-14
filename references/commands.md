@@ -3,6 +3,20 @@
 Use a quoted project name or its 24-character project ID. IDs avoid ambiguity.
 Omit the project only when the current directory has a valid `.olcli.json`.
 
+## Editing rules
+
+Always edit against the live remote content. Do not download a file, modify a
+local copy, and upload it back, and do not reuse content fetched earlier in the
+session or in an earlier run. The direct commands read the document immediately
+before writing for exactly this reason: Overleaf projects are edited
+concurrently, so a base that was not just read may already be superseded by
+someone else's text.
+
+Whole-document replacement is allowed only into an empty document. `edit`,
+`write`, and `upload --to` refuse to overwrite a non-empty text document. Send
+any change to existing text as `replace`, `insert`, `append`, or `prepend`.
+Delete and recreate a file only when a full rewrite was explicitly requested.
+
 ## Inspect and create projects
 
 ```bash
@@ -22,17 +36,25 @@ olcli zip "My Paper" --output /tmp/my-paper.zip
 olcli info "My Paper" --json
 ```
 
-## Replace an entire existing text document
+## Fill an empty text document
+
+`edit` writes content into a document that is still empty. It refuses a
+non-empty document, because replacing a whole document discards whatever a
+collaborator wrote since that content was last read. Use "Precise editing" below
+to change text that already exists, or `write` to create a document that does
+not exist yet.
 
 Exactly one content source is required:
 
 ```bash
-olcli edit main.tex "My Paper" --content '\section{Replacement}'
-olcli edit main.tex "My Paper" --from /tmp/replacement.tex
-printf '%s' '\section{Replacement}' | olcli edit main.tex "My Paper" --stdin
+olcli edit chapters/placeholder.tex "My Paper" --content '\section{Replacement}'
+olcli edit chapters/placeholder.tex "My Paper" --from /tmp/replacement.tex
+printf '%s' '\section{Replacement}' | olcli edit chapters/placeholder.tex "My Paper" --stdin
 ```
 
-`edit` requires an existing remote document and verifies the saved result.
+`edit` requires an existing, empty remote document, sends a versioned OT update,
+and verifies the saved result. Runs of whitespace count as empty; any real text
+does not.
 
 ## Precise editing
 
@@ -57,7 +79,7 @@ $Text = @'
 \section{Method}
 New paragraph.
 '@
-$Text | olcli edit main.tex 'My Paper' --stdin
+$Text | olcli write chapters/method.tex 'My Paper' --stdin
 ```
 
 ## Create folders and text files
@@ -70,8 +92,10 @@ olcli write data/notes.txt "My Paper" --from /tmp/notes.txt
 printf '%s' '@article{key,...}' | olcli write references/new.bib "My Paper" --stdin
 ```
 
-`write` creates missing parent folders, creates or replaces text, and verifies
-the result. It refuses to replace an existing binary file.
+`write` creates missing parent folders, creates a document, or fills an existing
+empty one, and verifies the result. It refuses to overwrite a non-empty document
+as a whole, and refuses to replace an existing binary file. To change text that
+is already there, use `replace`, `insert`, `append`, or `prepend`.
 
 ## Upload images and other files
 
@@ -81,7 +105,9 @@ olcli upload supplement.pdf "My Paper" --to supplements/supplement.pdf
 olcli upload references.bib "My Paper" --to bibliography/references.bib
 ```
 
-`--to` is the complete remote path. Missing parent folders are created.
+`--to` is the complete remote path. Missing parent folders are created. An upload
+that would land on an existing non-empty text document is refused; new paths and
+binary targets such as images and PDFs are unaffected.
 
 Verify important binaries on macOS/Linux:
 
@@ -174,3 +200,39 @@ authoritative rejoin. `--verify` performs an extra rejoin and exact comparison.
 `refresh` marks joined documents stale so the next access reloads them.
 Operations are processed sequentially, so wait for each JSON response before
 sending the next command.
+
+A long-lived session is the safest way to edit a document that other people are
+also writing to, because the connection follows their updates as they arrive
+instead of re-reading the document for every change. The session still enforces
+the editing rules above: `write` into a non-empty document and `upload` over a
+non-empty text document are rejected, and `replace`/`insert`/`append`/`prepend`
+remain the way to change existing text.
+
+### Keeping a session alive with tmux (macOS/Linux)
+
+Starting `olcli live` costs about three seconds of connection setup, so a
+sequence of edits should reuse one session rather than open a new one per
+change. Host it in tmux so it survives the terminal that started it:
+
+```bash
+tmux new-session -d -s olcli -n paper \
+  'while :; do olcli live "My Paper"; echo "  -> exited $?, restarting"; sleep 2; done'
+```
+
+tmux has no built-in restart-on-crash, so the `while` loop above provides it and
+also leaves each crash's exit reason in the scrollback. A tmux server is a single
+per-user process: several terminals, and several agent sessions, all attach to
+the same connection. Drive it with `tmux send-keys -t olcli:paper -l '<json>'`
+followed by `tmux send-keys -t olcli:paper Enter`, and read replies with
+`tmux capture-pane -pJ -t olcli:paper -S -` (`-J` re-joins wrapped lines, which
+otherwise split long JSON across display rows). Keep to one writer per window:
+concurrent senders interleave their replies.
+
+A dropped connection (laptop sleep, network change, an Overleaf deploy) needs no
+manual intervention: the client reconnects lazily at the start of the next
+operation, re-joins the documents it was using, and carries on. The reconnect is
+deliberately withheld from an operation that was already in flight when the
+socket died, because the server may or may not have applied it; that operation
+reports an error rather than being retried silently. Note that `ping` is answered
+locally and does not prove the connection is alive; a `replace` whose search
+string cannot match does, and it cannot have written anything.

@@ -117,6 +117,13 @@ Do not perform remote mutations if either command fails.
 | Require the low-latency path | `olcli live "My Paper" --transport ot` | Fails instead of falling back when OT is unavailable |
 | Diagnose an older self-hosted instance | `olcli live "My Paper" --transport http` | Uses verified HTTP document replacement |
 
+Existing text is never replaced wholesale. `edit` and `write` only fill a
+document that is still empty, and `upload --to` refuses to land on a non-empty
+text document. Every direct command reads the document's current remote content
+immediately before writing, so prepare changes from that live content rather
+than from a copy downloaded earlier, and express them as `replace`, `insert`,
+`append`, or `prepend` operations.
+
 ## Common commands
 
 ```bash
@@ -154,6 +161,13 @@ Operations run sequentially. Wait for each JSON response before sending the
 next operation. Responses identify the transport, verification state, and
 elapsed time. See the [complete command guide](references/commands.md) for all
 operations and protocol fields.
+
+For work that spans more than one sitting, host the session in `tmux` (one
+window per project) so it outlives the terminal that started it. tmux has no
+restart-on-crash, so wrap the command in a loop; then drive it with
+`tmux send-keys` and read replies with `tmux capture-pane -pJ`. One tmux server
+serves every terminal on the machine, so several sessions share a single
+connection. See [keeping a session alive with tmux](references/commands.md#keeping-a-session-alive-with-tmux-macoslinux).
 
 ## Safety and compatibility
 

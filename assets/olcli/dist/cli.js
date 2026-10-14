@@ -122,6 +122,20 @@ async function transformRemoteDocumentHttp(client, projectId, file, transform) {
         throw new Error('The requested operation did not change the document');
     await client.updateDocumentByPath(projectId, file, updated);
 }
+/**
+ * Overleaf documents are edited collaboratively, so replacing a non-empty
+ * document with freshly generated content silently discards every change a
+ * collaborator made since this process last read the file. The only safe
+ * whole-document write is into a document that is still empty (or that does
+ * not exist yet); everything else has to go through targeted operations.
+ */
+function assertWholeDocumentWriteAllowed(path, existing) {
+    if (existing.trim().length > 0) {
+        throw new Error(`Refusing to replace the non-empty document ${path} as a whole. ` +
+            `Apply targeted edits instead (replace, insert, append, prepend), ` +
+            `or delete ${path} first if a full rewrite is genuinely intended.`);
+    }
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTH COMMANDS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -443,7 +457,7 @@ program
 // ─────────────────────────────────────────────────────────────────────────────
 program
     .command('edit <file> [project]')
-    .description('Replace a text document directly on Overleaf (no local sync)')
+    .description('Fill an empty remote text document, sent as a versioned OT update')
     .option('-f, --from <path>', 'Read replacement content from a local file')
     .option('-c, --content <text>', 'Use the provided text as replacement content')
     .option('--stdin', 'Read replacement content from standard input')
@@ -471,8 +485,11 @@ program
         }
         const client = await getClient(options.cookie);
         const proj = await resolveProject(client, project);
-        await client.updateDocumentByPath(proj.id, file, content);
-        spinner.succeed(`Edited ${file} directly in "${proj.name}" and verified the saved content`);
+        await transformRemoteDocument(client, proj.id, file, (existing) => {
+            assertWholeDocumentWriteAllowed(file, existing);
+            return content;
+        });
+        spinner.succeed(`Edited ${file} in "${proj.name}" and verified the saved content`);
         setLastProject(proj.id);
     }
     catch (error) {
@@ -618,7 +635,10 @@ program
         if (existing) {
             if (existing.type !== 'doc')
                 throw new Error(`Cannot replace binary file with write: ${file}`);
-            await transformRemoteDocument(client, proj.id, file, () => content);
+            await transformRemoteDocument(client, proj.id, file, (current) => {
+                assertWholeDocumentWriteAllowed(file, current);
+                return content;
+            });
         }
         else {
             const folderTree = await client.getFolderTree(proj.id);
@@ -681,10 +701,11 @@ program
             verify: options.verify === true,
             fallbackReason,
         }));
-        const buildTransform = (op, command) => (existing) => {
+        const buildTransform = (op, command, path) => (existing) => {
             if (op === 'write') {
                 if (typeof command.content !== 'string')
                     throw new Error('write requires content');
+                assertWholeDocumentWriteAllowed(path, existing);
                 return command.content;
             }
             if (op === 'replace') {
@@ -764,6 +785,10 @@ program
                     if (typeof command.localPath !== 'string' || typeof command.path !== 'string') {
                         throw new Error('upload requires localPath and path');
                     }
+                    const existing = await client.findEntityByPath(proj.id, command.path);
+                    if (existing?.type === 'doc') {
+                        assertWholeDocumentWriteAllowed(command.path, await client.readDocumentByPath(proj.id, command.path));
+                    }
                     const data = readFileSync(command.localPath);
                     const result = await client.uploadFile(proj.id, null, command.path, data, await getFolderTree());
                     if (result.entityType === 'doc' && result.entityId)
@@ -776,7 +801,7 @@ program
                 }
                 if (typeof command.path !== 'string' || !command.path)
                     throw new Error(`${op} requires path`);
-                const transform = buildTransform(op, command);
+                const transform = buildTransform(op, command, command.path);
                 let resultTransport = transport;
                 let content;
                 if (realtime && realtime.hasDocument(command.path)) {
@@ -798,6 +823,9 @@ program
                     if (existing) {
                         if (existing.type !== 'doc')
                             throw new Error(`Cannot replace binary file: ${command.path}`);
+                        // Re-read immediately before the write so the empty-document check
+                        // sees the collaborator's current content, not a stale snapshot.
+                        assertWholeDocumentWriteAllowed(command.path, await client.readDocumentByPath(proj.id, command.path));
                         await client.updateDocumentByPath(proj.id, command.path, updated);
                     }
                     else {
@@ -851,6 +879,10 @@ program
         // Pass folder ID or null for root folder (client will compute it)
         const folderId = options.folder || null;
         const folderTree = options.folder ? undefined : await client.getFolderTree(proj.id);
+        const existing = await client.findEntityByPath(proj.id, remotePath);
+        if (existing?.type === 'doc') {
+            assertWholeDocumentWriteAllowed(remotePath, await client.readDocumentByPath(proj.id, remotePath));
+        }
         const result = await client.uploadFile(proj.id, folderId, remotePath, content, folderTree);
         if (result.success) {
             spinner.succeed(`Uploaded: ${file} → ${remotePath} in "${proj.name}"`);

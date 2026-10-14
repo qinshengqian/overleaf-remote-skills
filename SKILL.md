@@ -8,7 +8,10 @@ description: Install and use the bundled olcli to create, inspect, edit, precise
 Use the bundled olcli build for direct Overleaf operations. Prefer precise
 remote commands (`replace`, `insert`, `append`, `prepend`, `write`, `mkdir`,
 and `upload --to`) over maintaining a continuously synchronized local copy when
-the user wants changes made directly on Overleaf.
+the user wants changes made directly on Overleaf. `edit` is not a general editor:
+it only fills an empty document, and `write` only creates a document or fills an
+empty one. Whole-document replacement is refused everywhere else, so plan every
+change as a targeted operation against the document's live content.
 
 For multiple edits in one working session, prefer `olcli live`: it keeps one
 Overleaf collaboration WebSocket open, joins text documents lazily, and sends
@@ -18,6 +21,14 @@ document after a race. `auto` mode falls back to verified HTTP replacement only
 when the failure happened before an OT write was sent; uncertain writes are
 never retried blindly. Use `--transport ot` to require OT or `--transport http`
 to diagnose compatibility with older self-hosted instances.
+
+On a machine with `tmux`, keep that session alive in tmux instead of starting a
+new `olcli live` for every request: one tmux window per project, driven with
+`tmux send-keys` and read back with `tmux capture-pane -pJ`. A tmux server is a
+single per-user process, so several terminals and several agent sessions share
+one connection. Wrap the command in a restart loop so a crash reconnects:
+`while :; do olcli live <projectId>; sleep 2; done`. Never drive one window from
+two writers at once; the JSON responses interleave.
 
 ## Route the task
 
@@ -38,20 +49,41 @@ to diagnose compatibility with older self-hosted instances.
 2. Authentication permits access; it does not by itself authorize creating,
    editing, deleting, renaming, or compiling a project. Confirm that the user's
    request covers the intended remote mutation.
-3. Resolve the exact project and remote path before mutation. Prefer a project
+3. Never edit from a stale copy. Compute every change against the document's
+   current remote content. Do not download a file, edit it locally, and upload
+   it back; do not reuse content read earlier in this conversation, in a
+   previous session, or from a local checkout. Re-read first. `olcli live`
+   follows collaborator updates as they arrive, and the one-shot commands
+   re-read immediately before writing. A base that was not freshly read may
+   already be superseded by someone else's text.
+4. Never replace a whole document unless it is empty. `edit`, `write`, and
+   `upload --to` refuse to overwrite a non-empty text document, because a
+   wholesale write silently discards everything a collaborator added since that
+   content was read. Express the change as targeted operations (`replace`,
+   `insert`, `append`, `prepend`) instead. Delete and recreate a file only when
+   the user has explicitly asked for a full rewrite.
+5. Resolve the exact project and remote path before mutation. Prefer a project
    ID when names are ambiguous.
-4. Use `replace` for an exact, unique change. It refuses multiple matches unless
+6. Use `replace` for an exact, unique change. It refuses multiple matches unless
    `--all` is explicit. Use `insert` with a stable anchor and
    `--occurrence <n>` when the anchor repeats.
-5. Use `write` to create or replace text documents, `mkdir` for folders, and
-   `upload --to` for images, PDFs, bibliographies, archives, or other files.
-6. Preserve the built-in versioned OT acknowledgement or HTTP read-after-write verification. For binary uploads,
+7. Use `write` to create a text document or fill an empty one, `mkdir` for
+   folders, and `upload --to` for images, PDFs, bibliographies, archives, or
+   other new files.
+8. Preserve the built-in versioned OT acknowledgement or HTTP read-after-write verification. For binary uploads,
    download to a temporary file and compare hashes or bytes when correctness
    matters.
-7. Do not start a pull/push daemon unless the user explicitly asks for ongoing
+9. Do not start a pull/push daemon unless the user explicitly asks for ongoing
    synchronization. The direct commands are designed to avoid that workflow.
-8. After repeated authentication failures, ask the user to refresh the cookie;
-   do not keep retrying a possibly expired credential.
+10. After repeated authentication failures, ask the user to refresh the cookie;
+    do not keep retrying a possibly expired credential.
+11. For a sequence of edits to one project, reuse a persistent `olcli live`
+    session instead of paying a fresh connection per change. Where `tmux`
+    exists, host that session in tmux (one window per project), send operations
+    with `tmux send-keys`, and read the JSON responses with
+    `tmux capture-pane -pJ`. Keep one writer per window: two senders at once
+    interleave their responses and you can no longer tell which reply belongs
+    to which operation.
 
 ## Bundled implementation
 

@@ -30,12 +30,27 @@ export declare class OverleafRealtimeSession {
     private documentIds;
     private fileCount;
     private closed;
+    private needsReconnect;
+    private reconnecting;
     private operationChain;
     private info;
     private constructor();
     static connect(baseUrl: string, projectId: string, cookie: string): Promise<OverleafRealtimeSession>;
     get sessionInfo(): RealtimeSessionInfo;
     private open;
+    /**
+     * The collaboration socket can die without the process noticing: a sleeping
+     * laptop, a network switch, or an Overleaf deploy leaves it half-open, and
+     * every later operation would fail with "connection is not open" until the
+     * whole session is restarted.
+     *
+     * Reconnect lazily, at the start of an operation. An idle session then costs
+     * nothing, and a write is never retried behind the caller's back: an
+     * operation that was in flight when the socket dropped still fails, because
+     * the server may or may not have applied it.
+     */
+    private ensureConnected;
+    private reconnect;
     private indexProject;
     registerDocument(path: string, id: string): void;
     hasDocument(path: string): boolean;

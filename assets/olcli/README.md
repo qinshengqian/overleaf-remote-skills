@@ -168,13 +168,13 @@ All commands auto-detect the project when run from a synced directory (contains 
 | `olcli push [dir]` | Upload local changes to Overleaf |
 | `olcli sync [dir]` | Bidirectional sync (pull + push) |
 | `olcli upload <file> [project] --to <remote-path>` | Upload a file and create remote parent folders |
-| `olcli edit <file> [project] --from <path>` | Replace a text document directly on Overleaf |
+| `olcli edit <file> [project] --from <path>` | Fill an empty remote text document (versioned OT update) |
 | `olcli replace <file> <old> <new> [project]` | Safely replace exact remote text |
 | `olcli insert <file> <anchor> <text> [project]` | Insert after/before an exact anchor |
 | `olcli append <file> <text> [project]` | Append text to a remote document |
 | `olcli prepend <file> <text> [project]` | Prepend text to a remote document |
 | `olcli mkdir <folder> [project]` | Create nested remote folders |
-| `olcli write <file> [project] --content <text>` | Create or replace a remote text file |
+| `olcli write <file> [project] --content <text>` | Create a remote text document, or fill an empty one |
 | `olcli live [project]` | Keep an authenticated low-latency JSON-lines editing session open |
 | `olcli download <file> [project]` | Download a single file |
 | `olcli delete <file> [project]` | Delete a remote file or folder by path (alias: `rm`) |
@@ -190,13 +190,17 @@ All commands auto-detect the project when run from a synced directory (contains 
 
 ### Edit entirely on Overleaf
 
-`edit` replaces an existing Overleaf text document through the remote API and
-verifies the saved result. It does not create a local project copy.
+Every direct command works against the remote project and verifies the saved
+result. None of them create a local project copy, and none of them replace text
+wholesale: `edit` and `write` only fill a document that is still empty, and
+`upload --to` refuses to overwrite a non-empty text document. Compute a change
+from the document's current remote content rather than from a copy downloaded
+earlier, and send it as `replace`, `insert`, `append`, or `prepend`.
 
 ```bash
-olcli edit main.tex "My Thesis" --content '\\documentclass{article}\n\\begin{document}Hello\\end{document}'
-olcli edit main.tex "My Thesis" --from /tmp/replacement.tex
-printf '%s' '\\section{Remote edit}' | olcli edit chapter.tex "My Thesis" --stdin
+olcli edit chapters/placeholder.tex "My Thesis" --content '\section{Introduction}'
+olcli edit chapters/placeholder.tex "My Thesis" --from /tmp/section.tex
+printf '%s' '\section{Remote edit}' | olcli edit chapters/placeholder.tex "My Thesis" --stdin
 olcli replace main.tex 'old sentence' 'new sentence' "My Thesis"
 olcli insert main.tex '\\section{Method}' $'\nNew paragraph.' "My Thesis"
 olcli insert main.tex '\\end{document}' $'New appendix.\n' "My Thesis" --before
@@ -231,7 +235,18 @@ olcli live "My Thesis"
 Every OT write waits for Overleaf's versioned apply acknowledgement. Add
 `--verify` for an extra document rejoin and exact comparison. Use
 `--transport ot` to require OT, `--transport http` for compatibility testing,
-and `refresh` to force joined documents to reload.
+and `refresh` to force joined documents to reload. A session follows
+collaborator updates as they arrive, which is why it is the safest way to edit a
+document that other people are also writing to. The empty-document rule above
+still applies inside the session: `write` over a non-empty document and `upload`
+over a non-empty text document are rejected.
+
+A session reconnects on its own if the collaboration socket drops, which is what
+a sleeping laptop, a network change, or an Overleaf deploy looks like. It
+reconnects lazily before the next operation and re-joins whatever documents it
+was using. An operation that was already in flight when the socket died is not
+retried, since the server may or may not have applied it, and reports an error
+instead.
 
 ## Use Cases
 
