@@ -163,11 +163,12 @@ elapsed time. See the [complete command guide](references/commands.md) for all
 operations and protocol fields.
 
 For work that spans more than one sitting, host the session in `tmux` (one
-window per project) so it outlives the terminal that started it. tmux has no
-restart-on-crash, so wrap the command in a loop; then drive it with
-`tmux send-keys` and read replies with `tmux capture-pane -pJ`. One tmux server
-serves every terminal on the machine, so several sessions share a single
-connection. See [keeping a session alive with tmux](references/commands.md#keeping-a-session-alive-with-tmux-macoslinux).
+window per project) so it outlives the terminal that started it. The skill ships
+two scripts for this: `scripts/run-live.sh` keeps the session running and
+restarts it if it exits, and `scripts/olcli-live` sends operations and waits for
+their replies. One tmux server serves every terminal on the machine, so several
+sessions share a single connection. See
+[keeping a session alive with tmux](references/commands.md#keeping-a-session-alive-with-tmux-macoslinux).
 
 ## Safety and compatibility
 
@@ -197,7 +198,7 @@ upstream change may require a compatibility update.
 SKILL.md                       Codex Skill entry point
 agents/openai.yaml             Codex UI metadata
 references/                    Setup, commands, and troubleshooting
-scripts/                       macOS/Linux and Windows installers/checkers
+scripts/                       Installers, checkers, and the tmux session helpers
 assets/olcli/                  Enhanced olcli source, build, and tests
 ```
 

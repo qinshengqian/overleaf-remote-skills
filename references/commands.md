@@ -212,21 +212,37 @@ remain the way to change existing text.
 
 Starting `olcli live` costs about three seconds of connection setup, so a
 sequence of edits should reuse one session rather than open a new one per
-change. Host it in tmux so it survives the terminal that started it:
+change. The skill ships two scripts for that: `scripts/run-live.sh` keeps the
+session running and restarts it if it exits, and `scripts/olcli-live` drives it.
 
 ```bash
-tmux new-session -d -s olcli -n paper \
-  'while :; do olcli live "My Paper"; echo "  -> exited $?, restarting"; sleep 2; done'
+SKILL=~/.codex/skills/overleaf-remote           # wherever this skill lives
+ln -s "$SKILL/scripts/olcli-live" ~/.local/bin/ # optional, to call it by name
+
+tmux new-session -d -s olcli -n paper "$SKILL/scripts/run-live.sh 'My Paper'"
+
+olcli-live ls
+olcli-live send paper '{"op":"replace","path":"main.tex","search":"old","replacement":"new"}'
+olcli-live read paper
+olcli-live attach paper
 ```
 
-tmux has no built-in restart-on-crash, so the `while` loop above provides it and
-also leaves each crash's exit reason in the scrollback. A tmux server is a single
-per-user process: several terminals, and several agent sessions, all attach to
-the same connection. Drive it with `tmux send-keys -t olcli:paper -l '<json>'`
-followed by `tmux send-keys -t olcli:paper Enter`, and read replies with
-`tmux capture-pane -pJ -t olcli:paper -S -` (`-J` re-joins wrapped lines, which
-otherwise split long JSON across display rows). Keep to one writer per window:
-concurrent senders interleave their replies.
+`run-live.sh` wraps `olcli live` in a restart loop, because tmux has no
+restart-on-crash of its own; running it that way also leaves each crash's exit
+code and timestamp in the pane's scrollback. Use one window per project. A tmux
+server is a single per-user process, so every terminal on the machine, and
+every agent session, shares the same connection and can drive the same window.
+
+`olcli-live send` writes one operation and waits for its reply, printing it, so
+operations can be issued one at a time without reading the pane by hand. Keep to
+one writer per window: concurrent senders interleave their replies, and there is
+then no way to tell which reply belongs to which operation.
+
+Both scripts are thin tmux wrappers. Doing it by hand is
+`tmux send-keys -t olcli:paper -l '<json>'` followed by
+`tmux send-keys -t olcli:paper Enter`, read back with
+`tmux capture-pane -pJ -t olcli:paper -S -`. The `-J` matters: without it, the
+display wrapping of a narrow pane splits long JSON across rows.
 
 A dropped connection (laptop sleep, network change, an Overleaf deploy) needs no
 manual intervention: the client reconnects lazily at the start of the next

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Drive the tmux-hosted persistent `olcli live` session created by run-live.sh.
+#
+#   olcli-live ls                        list project windows
+#   olcli-live read <window> [lines]     show the last lines of a window
+#   olcli-live send <window> '<json-op>' send one operation, wait for its reply
+#   olcli-live attach [window]           attach interactively (Ctrl-b d to detach)
+#
+# The session name defaults to `olcli`; override it with OLCLI_TMUX_SESSION.
+# Put this on PATH to use it as `olcli-live`:
+#
+#   ln -s "<skill>/scripts/olcli-live" ~/.local/bin/olcli-live
+#
+# Keep to one writer per window. Two senders at once interleave their replies
+# in the pane, and there is then no way to tell which reply belongs to which
+# operation.
+set -uo pipefail
+SESS="${OLCLI_TMUX_SESSION:-olcli}"
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  olcli-live ls                        list project windows
+  olcli-live read <window> [lines]     show the last lines of a window (default 20)
+  olcli-live send <window> '<json-op>' send one operation and wait for its reply
+  olcli-live attach [window]           attach interactively (Ctrl-b d to detach)
+EOF
+  exit 2
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  ls)
+    tmux list-windows -t "$SESS" -F '#{window_name}' 2>/dev/null || {
+      echo "no tmux session '$SESS'." >&2
+      echo "start one window per project, for example:" >&2
+      echo "  tmux new-session -d -s $SESS -n paper \"$(dirname "$0")/run-live.sh <projectId>\"" >&2
+      exit 1; } ;;
+  read)
+    win="${1:?usage: olcli-live read <window> [lines]}"; n="${2:-20}"
+    tmux capture-pane -pJ -t "$SESS:$win" -S - | grep -v '^[[:space:]]*$' | tail -n "$n" ;;
+  attach)
+    exec tmux attach -t "$SESS${1:+:$1}" ;;
+  send)
+    win="${1:?usage: olcli-live send <window> '<json-op>'}"; shift
+    op="$*"; [ -n "$op" ] || usage
+    target="$SESS:$win"
+    tmux has-session -t "$SESS" 2>/dev/null || { echo "no tmux session '$SESS'" >&2; exit 1; }
+    # -l sends the text literally. Without it tmux reads words such as "Enter"
+    # inside the JSON as key names.
+    tmux send-keys -t "$target" -l "$op"
+    tmux send-keys -t "$target" Enter
+    # Every reply carries "elapsedMs" and the echoed request does not, so the
+    # first such line after the last echo of this request is its reply. Using
+    # the last echo means repeating an identical operation still matches the
+    # right reply. -J re-joins lines tmux wrapped for display, so a narrow pane
+    # cannot split the JSON across rows.
+    for _ in $(seq 1 300); do
+      resp=$(tmux capture-pane -pJ -t "$target" -S - | awk -v op="$op" '
+        { b[NR] = $0 }
+        END {
+          last = 0
+          for (i = 1; i <= NR; i++) if (b[i] == op) last = i
+          if (last == 0) exit 1
+          for (i = last + 1; i <= NR; i++)
+            if (b[i] ~ /"elapsedMs"/) { print b[i]; exit 0 }
+          exit 1
+        }')
+      [ -n "$resp" ] && { printf '%s\n' "$resp"; exit 0; }
+      sleep 0.2
+    done
+    echo "olcli-live: timed out waiting for a reply from $target" >&2; exit 1 ;;
+  *) usage ;;
+esac

@@ -23,12 +23,13 @@ never retried blindly. Use `--transport ot` to require OT or `--transport http`
 to diagnose compatibility with older self-hosted instances.
 
 On a machine with `tmux`, keep that session alive in tmux instead of starting a
-new `olcli live` for every request: one tmux window per project, driven with
-`tmux send-keys` and read back with `tmux capture-pane -pJ`. A tmux server is a
-single per-user process, so several terminals and several agent sessions share
-one connection. Wrap the command in a restart loop so a crash reconnects:
-`while :; do olcli live <projectId>; sleep 2; done`. Never drive one window from
-two writers at once; the JSON responses interleave.
+new `olcli live` for every request: one tmux window per project. Use the
+bundled `scripts/run-live.sh` to run it (it restarts the session if it exits,
+since tmux has no restart-on-crash of its own) and `scripts/olcli-live` to send
+operations and wait for their replies. A tmux server is a single per-user
+process, so several terminals and several agent sessions share one connection.
+Never drive one window from two writers at once; the JSON replies interleave and
+you can no longer tell which reply belongs to which operation.
 
 ## Route the task
 
@@ -79,11 +80,11 @@ two writers at once; the JSON responses interleave.
     do not keep retrying a possibly expired credential.
 11. For a sequence of edits to one project, reuse a persistent `olcli live`
     session instead of paying a fresh connection per change. Where `tmux`
-    exists, host that session in tmux (one window per project), send operations
-    with `tmux send-keys`, and read the JSON responses with
-    `tmux capture-pane -pJ`. Keep one writer per window: two senders at once
-    interleave their responses and you can no longer tell which reply belongs
-    to which operation.
+    exists, host that session in tmux (one window per project) with
+    `scripts/run-live.sh`, and drive it with `scripts/olcli-live send`, which
+    waits for each reply. Keep one writer per window: two senders at once
+    interleave their replies and you can no longer tell which reply belongs to
+    which operation.
 
 ## Bundled implementation
 
