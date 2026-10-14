@@ -178,6 +178,14 @@ line. Keep the process open and send operations through the same standard input:
 
 ```json
 {"op":"ping"}
+{"op":"ls"}
+{"op":"read","path":"main.tex"}
+{"op":"read","path":"main.tex","offset":1,"limit":40}
+{"op":"read","path":"main.tex","force":true}
+{"op":"stat"}
+{"op":"stat","path":"main.tex"}
+{"op":"mirror","intervalMs":1000}
+{"op":"mirror","stop":true}
 {"op":"replace","path":"main.tex","search":"old","replacement":"new"}
 {"op":"replace","path":"main.tex","search":"TODO","replacement":"","all":true}
 {"op":"insert","path":"main.tex","anchor":"\\end{document}","text":"Appendix text\n","before":true}
@@ -208,6 +216,53 @@ the editing rules above: `write` into a non-empty document and `upload` over a
 non-empty text document are rejected, and `replace`/`insert`/`append`/`prepend`
 remain the way to change existing text.
 
+### Reading documents from a live session
+
+A live session already holds the text of every document it has joined, so it can
+read them back without a download:
+
+- `{"op":"ls"}` lists every document and binary file path in the project.
+- `{"op":"read","path":P}` writes the current text to
+  `~/.olcli/live/<projectId>/<path>` and answers with the local `file`, its
+  `bytes`, the document `version`, and a short content `hash`.
+- `{"op":"read","path":P,"offset":N,"limit":M}` returns a bounded slice of text
+  inline instead of a file, for spot checks. Inline replies are capped at 64 KB
+  and set `truncated` if they hit the cap.
+- `force:true` rejoins the document first, when the cached copy must not be
+  trusted.
+
+**The local copy is a read-only mirror.** It is overwritten whenever the remote
+moves; never edit these files by hand, and never upload them back. Change
+content through `replace`/`insert`/`append` as usual.
+
+### Knowing whether someone else changed a document
+
+`read` and `stat` report two independent flags, because "my copy is stale" and
+"someone else is editing" are different questions:
+
+- `changedSinceLastRead` - the version moved since your last `read`. This
+  includes your own edits.
+- `remoteChanged` - another connection edited it since your last `read`. The
+  server tags edits by socket, so your own browser tab, or a second `olcli live`
+  session on the same project, counts as remote.
+
+Both are driven by the version and by a counter of remote edits that survives a
+rejoin or a reconnect. `stale:true` means the session's copy can no longer be
+trusted; the next read rejoins. Note the low-latency path is best-effort: a
+half-open socket can report `stale:false` with an out-of-date copy, so
+`force:true` is the correctness escape hatch.
+
+### Keeping a local mirror in sync
+
+`{"op":"mirror","intervalMs":1000}` reconciles tracked documents on a timer:
+for each one it compares the remote content hash against the local file and
+pulls the remote down when they differ. A collaborator's edit also triggers an
+immediate reconcile, so the local copy follows within a fraction of a second;
+the interval is the safety net. `{"op":"mirror","stop":true}` stops it, and
+`{"op":"stat"}` reports `inSync`, `remoteEdits`, `pulls`, and the last pull time
+per document. Each actual pull logs a `{"status":"event",...}` line. The mirror
+requires the realtime transport and is one-way: remote to local.
+
 ### Keeping a session alive with tmux (macOS/Linux)
 
 Starting `olcli live` costs about three seconds of connection setup, so a
@@ -223,9 +278,17 @@ tmux new-session -d -s olcli -n paper "$SKILL/scripts/run-live.sh 'My Paper'"
 
 olcli-live ls
 olcli-live send paper '{"op":"replace","path":"main.tex","search":"old","replacement":"new"}'
+olcli-live files paper
+olcli-live cat paper main.tex
+olcli-live status paper
 olcli-live read paper
 olcli-live attach paper
 ```
+
+`olcli-live cat` reads a document and prints the local mirror path (or the text,
+for a ranged read), `files` lists the project, `status` shows reconciliation
+state, and `mirror` / `mirror-stop` drive the auto-pull mirror. `read` is the
+odd one out: it shows the tail of the tmux pane, not a document.
 
 On macOS and Linux, `install_olcli.sh` creates that `olcli-live` symlink for you,
 next to whichever `olcli` is on your PATH. **Windows is out of scope for this

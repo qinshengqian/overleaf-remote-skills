@@ -31,6 +31,16 @@ per-user process, so several terminals and several agent sessions share one
 connection. Never drive one window from two writers at once; the JSON replies
 interleave and you can no longer tell which reply belongs to which operation.
 
+A live session can also read: `{"op":"read","path":...}` returns a document's
+current text without a download, either written to a local mirror under
+`~/.olcli/live/<projectId>/` or, with `offset`/`limit`, as a bounded inline
+slice. `{"op":"ls"}` lists the project and `{"op":"stat"}` reports whether the
+local copy is current. `{"op":"mirror","intervalMs":1000}` keeps those copies
+in sync, pulling the remote down whenever it changes, and reports
+`remoteChanged` when another connection edited a document since your last read.
+The mirror is read-only: never edit those files, and never upload them back;
+change content only through `replace`/`insert`/`append`.
+
 This persistent-session workflow is macOS and Linux only. Both helpers are bash
 scripts, there is no PowerShell equivalent, and the installer deliberately does
 not place them on PATH on Windows. On Windows, start `olcli live` per request

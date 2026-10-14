@@ -151,6 +151,9 @@ It prints a `{"status":"ready",...}` response and then accepts one JSON object
 per line:
 
 ```json
+{"op":"read","path":"main.tex"}
+{"op":"stat"}
+{"op":"mirror","intervalMs":1000}
 {"op":"replace","path":"main.tex","search":"old","replacement":"new"}
 {"op":"insert","path":"main.tex","anchor":"\\end{document}","text":"Appendix\n","before":true}
 {"op":"compile"}
@@ -159,8 +162,10 @@ per line:
 
 Operations run sequentially. Wait for each JSON response before sending the
 next operation. Responses identify the transport, verification state, and
-elapsed time. See the [complete command guide](references/commands.md) for all
-operations and protocol fields.
+elapsed time. `read` mirrors a document into `~/.olcli/live/` and `mirror` keeps
+that copy in sync with the remote; see the
+[complete command guide](references/commands.md) for all operations and
+protocol fields.
 
 For work that spans more than one sitting, host the session in `tmux` (one
 window per project) so it outlives the terminal that started it. The skill ships

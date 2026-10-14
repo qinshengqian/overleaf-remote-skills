@@ -58,8 +58,9 @@ Windows.
 falls back to HTTP for handshake, document-type, or size failures that occur
 before sending an update. Use `--transport ot` to expose the underlying error.
 An error after an update was sent is intentionally not retried because the
-server outcome may be uncertain; issue `refresh`, inspect the document, and
-then decide whether to repeat the edit.
+server outcome may be uncertain; issue `refresh`, then `{"op":"read",...}` or
+`{"op":"stat"}` to inspect the document, and then decide whether to repeat the
+edit.
 
 ## Compile failed
 

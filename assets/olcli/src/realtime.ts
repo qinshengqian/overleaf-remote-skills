@@ -30,6 +30,59 @@ interface DocumentState {
   };
 }
 
+/**
+ * Per-document bookkeeping that must outlive a re-join or a reconnect.
+ *
+ * `DocumentState` is thrown away and rebuilt by `joinDocument`, and `reconnect`
+ * clears the whole `documents` map, so any counter kept on a `DocumentState`
+ * silently resets to zero on a `force` read, a `refresh`, a `--verify` write,
+ * or a dropped socket. These counters live in a side table keyed by path
+ * instead, which none of those paths touch.
+ */
+interface DocStats {
+  /** Applied updates that came from another connection, never our own ack. */
+  remoteEdits: number;
+  lastRemoteAt?: number;
+  /** Version and counter recorded at the caller's last `read`. */
+  lastReadVersion?: number;
+  lastReadRemoteEdits?: number;
+  /** What the local mirror last wrote for this path. */
+  lastPulledVersion?: number;
+  lastPulledHash?: string;
+  lastPulledAt?: number;
+  lastPulledBytes?: number;
+  lastPulledMtimeMs?: number;
+  pulls: number;
+}
+
+/** A point-in-time view of one document, captured without touching the network. */
+export interface DocReport {
+  path: string;
+  tracked: boolean;
+  stale: boolean;
+  version?: number;
+  remoteEdits: number;
+  lastRemoteAt?: number;
+  lastReadVersion?: number;
+  lastReadRemoteEdits?: number;
+  lastPulledVersion?: number;
+  lastPulledHash?: string;
+  lastPulledAt?: number;
+  lastPulledBytes?: number;
+  lastPulledMtimeMs?: number;
+  pulls: number;
+}
+
+export interface DocumentSnapshot {
+  path: string;
+  content: string;
+  version: number;
+  remoteEdits: number;
+  stale: boolean;
+  /** True when serving this snapshot required a fresh network join. */
+  rejoined: boolean;
+}
+
 interface PendingAck {
   resolve: (args: unknown[]) => void;
   reject: (error: Error) => void;
@@ -156,6 +209,10 @@ export class OverleafRealtimeSession {
   private eventWaiters = new Map<string, Array<(args: unknown[]) => void>>();
   private documents = new Map<string, DocumentState>();
   private documentIds = new Map<string, string>();
+  private fileIds = new Map<string, string>();
+  /** Survives re-join and reconnect; see DocStats. */
+  private stats = new Map<string, DocStats>();
+  private updateListeners = new Set<(path: string) => void>();
   private fileCount = 0;
   private closed = false;
   private needsReconnect = false;
@@ -302,19 +359,98 @@ export class OverleafRealtimeSession {
 
   private indexProject(roots: FolderLike[]): void {
     this.documentIds.clear();
-    this.fileCount = 0;
+    this.fileIds.clear();
     const visit = (folder: FolderLike, prefix: string) => {
       for (const doc of folder.docs || []) {
         this.documentIds.set(prefix ? `${prefix}/${doc.name}` : doc.name, doc._id);
       }
-      this.fileCount += (folder.fileRefs || []).length;
+      // Keep the binary paths, not just a count: `ls` needs to name them.
+      for (const file of folder.fileRefs || []) {
+        this.fileIds.set(prefix ? `${prefix}/${file.name}` : file.name, file._id);
+      }
       for (const child of folder.folders || []) {
         visit(child, prefix ? `${prefix}/${child.name}` : child.name);
       }
     };
     for (const root of roots) visit(root, '');
+    this.fileCount = this.fileIds.size;
     this.info.documents = this.documentIds.size;
     this.info.files = this.fileCount;
+  }
+
+  /** Every text-document path known to this project, sorted. */
+  listDocuments(): string[] {
+    return [...this.documentIds.keys()].sort();
+  }
+
+  /** Every binary file path known to this project, sorted. */
+  listFiles(): string[] {
+    return [...this.fileIds.keys()].sort();
+  }
+
+  /**
+   * Subscribe to edits that came from another connection. The listener gets the
+   * document path and must not throw; returns an unsubscribe function.
+   */
+  onUpdate(listener: (path: string) => void): () => void {
+    this.updateListeners.add(listener);
+    return () => {
+      this.updateListeners.delete(listener);
+    };
+  }
+
+  private statsFor(path: string): DocStats {
+    const normalized = path.replace(/^\/+/, '');
+    let entry = this.stats.get(normalized);
+    if (!entry) {
+      entry = { remoteEdits: 0, pulls: 0 };
+      this.stats.set(normalized, entry);
+    }
+    return entry;
+  }
+
+  /** A read-only view of one document's bookkeeping, with no network access. */
+  report(path: string): DocReport {
+    const normalized = path.replace(/^\/+/, '');
+    const state = this.documents.get(normalized);
+    const stats = this.stats.get(normalized);
+    const version = state && !state.stale ? state.version : undefined;
+    return {
+      path: normalized,
+      tracked: Boolean(state),
+      stale: state ? state.stale : false,
+      version,
+      remoteEdits: stats?.remoteEdits ?? 0,
+      lastRemoteAt: stats?.lastRemoteAt,
+      lastReadVersion: stats?.lastReadVersion,
+      lastReadRemoteEdits: stats?.lastReadRemoteEdits,
+      lastPulledVersion: stats?.lastPulledVersion,
+      lastPulledHash: stats?.lastPulledHash,
+      lastPulledAt: stats?.lastPulledAt,
+      lastPulledBytes: stats?.lastPulledBytes,
+      lastPulledMtimeMs: stats?.lastPulledMtimeMs,
+      pulls: stats?.pulls ?? 0,
+    };
+  }
+
+  /** Record that a caller has just observed this document's current version. */
+  noteRead(path: string): void {
+    const normalized = path.replace(/^\/+/, '');
+    const state = this.documents.get(normalized);
+    const stats = this.statsFor(normalized);
+    stats.lastReadVersion = state && !state.stale ? state.version : undefined;
+    stats.lastReadRemoteEdits = stats.remoteEdits;
+  }
+
+  /** Record that the local mirror has written this document to disk. */
+  notePull(path: string, info: { version?: number; hash: string; bytes: number; mtimeMs: number }): void {
+    const stats = this.statsFor(path);
+    stats.lastPulledVersion = info.version;
+    stats.lastPulledHash = info.hash;
+    stats.lastPulledAt = Date.now();
+    stats.lastPulledBytes = info.bytes;
+    stats.lastPulledMtimeMs = info.mtimeMs;
+    stats.pulls++;
   }
 
   registerDocument(path: string, id: string): void {
@@ -382,6 +518,28 @@ export class OverleafRealtimeSession {
     for (const resolve of waiters) resolve(event.args);
   }
 
+  /**
+   * An update that came from another connection. Our own writes are acked with
+   * no `op` array, so anything reaching here is someone else's edit.
+   *
+   * Note the server identifies the sender by socket, not by person: the same
+   * account editing in a browser tab, or a second `olcli live` on the same
+   * project, counts as remote here.
+   */
+  private noteRemoteEdit(path: string): void {
+    const stats = this.statsFor(path);
+    stats.remoteEdits++;
+    stats.lastRemoteAt = Date.now();
+    for (const listener of this.updateListeners) {
+      // A misbehaving listener must not break the socket message loop.
+      try {
+        listener(path);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   private handleOtUpdate(update: any): void {
     if (!update?.doc || !Number.isInteger(update.v)) return;
     const state = Array.from(this.documents.values()).find(item => item.id === update.doc);
@@ -391,6 +549,10 @@ export class OverleafRealtimeSession {
         clearTimeout(state.inFlight.timer);
         state.inFlight.resolve();
       } else {
+        // A collaborator edited while our write was in flight. The document is
+        // no longer trustworthy, and the edit must still be counted: count it
+        // here rather than falling through to the branch below.
+        this.noteRemoteEdit(state.path);
         state.inFlight.remoteDuringWrite = true;
         state.stale = true;
       }
@@ -401,6 +563,7 @@ export class OverleafRealtimeSession {
       return;
     }
     try {
+      this.noteRemoteEdit(state.path);
       state.content = applyTextOperations(state.content, update.op as TextOperation[]);
       state.version++;
     } catch {
@@ -469,8 +632,44 @@ export class OverleafRealtimeSession {
   }
 
   async read(path: string, force = false): Promise<string> {
+    return (await this.snapshot(path, force)).content;
+  }
+
+  /**
+   * Read one document's current content and version.
+   *
+   * With `force: false` and a healthy cache this is a pure map lookup, no
+   * network at all; it re-joins only when the document was never joined, is
+   * marked stale, or `force` is set.
+   *
+   * Content, version and staleness are copied out in one synchronous step:
+   * `handleOtUpdate` runs on the socket callback and applies a change
+   * atomically, so a reader sees the state either before or after an update,
+   * never half-way through one.
+   */
+  async snapshot(path: string, force = false): Promise<DocumentSnapshot> {
     await this.ensureConnected();
-    return (await this.joinDocument(path, force)).content;
+    const normalized = path.replace(/^\/+/, '');
+    const cached = this.documents.get(normalized);
+    const rejoined = !cached || cached.stale || force;
+    let state = await this.joinDocument(path, force);
+    // A reconnect can land between the await above and here, replacing or
+    // dropping the state we just obtained. Never serve a state this session no
+    // longer recognises as current.
+    if (this.documents.get(normalized) !== state || state.stale) {
+      state = await this.joinDocument(path, true);
+      if (this.documents.get(normalized) !== state || state.stale) {
+        throw new RealtimeUnavailableError('Could not obtain a consistent document snapshot', true);
+      }
+    }
+    return {
+      path: normalized,
+      content: state.content,
+      version: state.version,
+      remoteEdits: this.statsFor(normalized).remoteEdits,
+      stale: state.stale,
+      rejoined,
+    };
   }
 
   async refresh(path?: string): Promise<void> {

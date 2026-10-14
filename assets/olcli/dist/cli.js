@@ -8,12 +8,13 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { OverleafClient } from './client.js';
 import { RealtimeUnavailableError } from './realtime.js';
+import { LIVE_INLINE_LIMIT_BYTES, LIVE_MIRROR_DEFAULT_INTERVAL_MS, contentHash, liveMirrorFile, readLiveManifest, sliceLines, writeFileAtomic, writeLiveManifest, } from './livePaths.js';
 import { loadIgnore, shouldIgnore, buildTexSiblingSet, } from './ignore.js';
 // Read version from package.json
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -136,6 +137,15 @@ function assertWholeDocumentWriteAllowed(path, existing) {
             `or delete ${path} first if a full rewrite is genuinely intended.`);
     }
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// LIVE READ / LOCAL MIRROR
+//
+// `olcli live` keeps a document's text and version in memory. The read
+// operations expose that text, and the mirror keeps a read-only local copy of
+// it re-synced whenever the remote moves. Path mapping and the mirror file
+// layout live in ./livePaths.ts. The mirror is READ-ONLY: edits go through the
+// remote operations, never by writing one of these files.
+// ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTH COMMANDS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -701,6 +711,122 @@ program
             verify: options.verify === true,
             fallbackReason,
         }));
+        // ── Local mirror ──────────────────────────────────────────────────────
+        // A read-only copy of tracked documents under ~/.olcli/live/<projectId>/,
+        // reconciled against the remote on a timer and immediately when a
+        // collaborator's edit arrives. Never edit these files by hand: the next
+        // reconciliation overwrites them. Change content through the remote
+        // operations (replace/insert/append) instead.
+        let mirrorTimer;
+        let mirrorUnsubscribe;
+        const mirrorPaths = new Set();
+        let mirrorIntervalMs = LIVE_MIRROR_DEFAULT_INTERVAL_MS;
+        let mirrorQuiet = false;
+        let mirrorBusy = false;
+        let mirrorPending = false;
+        let opInFlight = false;
+        const mirrorManifest = readLiveManifest(proj.id);
+        const mirrorErrors = new Map();
+        // Event lines must never carry "elapsedMs": scripts/olcli-live finds a
+        // reply as the first line after the request echo that has it, so a stray
+        // one here would be handed back as that reply.
+        const emitLiveEvent = (event) => {
+            console.log(JSON.stringify({ status: 'event', at: new Date().toISOString(), ...event }));
+        };
+        /** Reconcile one document: pull it if the remote moved or the file drifted. */
+        const mirrorOne = async (remotePath) => {
+            if (!realtime)
+                return;
+            const target = liveMirrorFile(proj.id, remotePath);
+            const record = mirrorManifest[remotePath] || {};
+            const report = realtime ? realtime.report(remotePath) : undefined;
+            // Fast path: the remote version is unchanged since our last pull and the
+            // file is byte-identical to what we wrote (same size and mtime), so
+            // neither side moved. Idle ticks cost nothing.
+            if (report && report.version !== undefined && !report.stale &&
+                record.version === report.version && existsSync(target)) {
+                const stat = statSync(target);
+                if (stat.size === record.bytes && stat.mtimeMs === record.mtimeMs)
+                    return;
+            }
+            const snapshot = await realtime.snapshot(remotePath);
+            const hash = contentHash(snapshot.content);
+            const bytes = Buffer.byteLength(snapshot.content, 'utf-8');
+            const currentHash = existsSync(target) ? contentHash(readFileSync(target, 'utf-8')) : undefined;
+            const mtimeMs = currentHash === hash ? statSync(target).mtimeMs : writeFileAtomic(target, snapshot.content);
+            mirrorManifest[remotePath] = { version: snapshot.version, hash, bytes, mtimeMs, at: new Date().toISOString() };
+            realtime.notePull(remotePath, { version: snapshot.version, hash, bytes, mtimeMs });
+            mirrorErrors.delete(remotePath);
+            writeLiveManifest(proj.id, mirrorManifest);
+            if (currentHash === hash)
+                return; // already in sync; just re-armed the fast path
+            if (!mirrorQuiet)
+                emitLiveEvent({ event: 'pulled', path: remotePath, file: target, version: snapshot.version, bytes });
+        };
+        const runMirror = async () => {
+            // Never reconcile while an operation is being served: a re-join raced
+            // against an in-flight write could replace the state that write is
+            // waiting on. The op loop re-arms us when it finishes.
+            if (mirrorBusy || opInFlight) {
+                mirrorPending = true;
+                return;
+            }
+            mirrorBusy = true;
+            try {
+                for (const remotePath of [...mirrorPaths]) {
+                    try {
+                        await mirrorOne(remotePath);
+                    }
+                    catch (error) {
+                        const message = error?.message || String(error);
+                        if (!mirrorQuiet && mirrorErrors.get(remotePath) !== message) {
+                            mirrorErrors.set(remotePath, message);
+                            emitLiveEvent({ event: 'mirrorError', path: remotePath, message });
+                        }
+                    }
+                }
+            }
+            finally {
+                mirrorBusy = false;
+                if (mirrorPending) {
+                    mirrorPending = false;
+                    setImmediate(() => { void runMirror(); });
+                }
+            }
+        };
+        const stopMirror = () => {
+            if (mirrorTimer) {
+                clearInterval(mirrorTimer);
+                mirrorTimer = undefined;
+            }
+            if (mirrorUnsubscribe) {
+                mirrorUnsubscribe();
+                mirrorUnsubscribe = undefined;
+            }
+        };
+        const startMirror = () => {
+            if (mirrorTimer)
+                clearInterval(mirrorTimer);
+            mirrorTimer = setInterval(() => { void runMirror(); }, mirrorIntervalMs);
+            if (!mirrorUnsubscribe && realtime) {
+                mirrorUnsubscribe = realtime.onUpdate((remotePath) => {
+                    if (!mirrorPaths.has(remotePath))
+                        return;
+                    mirrorPending = true;
+                    if (!mirrorBusy && !opInFlight)
+                        void runMirror();
+                });
+            }
+        };
+        /** Paths the mirror would reconcile: manifest entries plus joined documents. */
+        const mirroredPaths = () => {
+            const paths = new Set(Object.keys(mirrorManifest));
+            if (realtime)
+                for (const p of realtime.listDocuments())
+                    if (realtime.report(p).tracked)
+                        paths.add(p);
+            return [...paths].sort();
+        };
         const buildTransform = (op, command, path) => (existing) => {
             if (op === 'write') {
                 if (typeof command.content !== 'string')
@@ -751,12 +877,18 @@ program
             if (!line)
                 continue;
             const started = Date.now();
+            opInFlight = true;
             try {
                 const command = JSON.parse(line);
                 const op = command.op;
                 if (op === 'quit') {
+                    stopMirror();
                     realtime?.close();
-                    console.log(JSON.stringify({ status: 'bye' }));
+                    console.log(JSON.stringify({ status: 'bye', elapsedMs: Date.now() - started }));
+                    // Closing the interface releases stdin; without it the event loop
+                    // stays alive and the process lingers, deaf, instead of exiting and
+                    // letting run-live.sh restart it.
+                    rl.close();
                     break;
                 }
                 if (op === 'ping') {
@@ -794,6 +926,151 @@ program
                     if (result.entityType === 'doc' && result.entityId)
                         realtime?.registerDocument(command.path, result.entityId);
                     console.log(JSON.stringify({ status: 'ok', op, path: command.path, bytes: data.length, elapsedMs: Date.now() - started }));
+                    continue;
+                }
+                if (op === 'ls') {
+                    const documents = realtime ? realtime.listDocuments() : [];
+                    const files = realtime ? realtime.listFiles() : [];
+                    console.log(JSON.stringify({
+                        status: 'ok', op, transport, documents, files,
+                        count: documents.length + files.length, elapsedMs: Date.now() - started,
+                    }));
+                    continue;
+                }
+                if (op === 'read') {
+                    if (typeof command.path !== 'string' || !command.path)
+                        throw new Error('read requires path');
+                    const remotePath = command.path;
+                    const force = command.force === true;
+                    // Capture the read baseline before noteRead() moves it.
+                    const before = realtime ? realtime.report(remotePath) : undefined;
+                    let content;
+                    let version = null;
+                    let remoteEdits = null;
+                    let stale = false;
+                    let tracked = false;
+                    let rejoined = false;
+                    let resultTransport = transport;
+                    if (realtime) {
+                        try {
+                            const snapshot = await realtime.snapshot(remotePath, force);
+                            content = snapshot.content;
+                            version = snapshot.version;
+                            remoteEdits = snapshot.remoteEdits;
+                            stale = snapshot.stale;
+                            tracked = true;
+                            rejoined = snapshot.rejoined;
+                        }
+                        catch (error) {
+                            if (!(error instanceof RealtimeUnavailableError) || !error.safeToFallback || options.transport === 'ot')
+                                throw error;
+                            content = await client.readDocumentByPath(proj.id, remotePath);
+                            resultTransport = 'http';
+                        }
+                    }
+                    else {
+                        content = await client.readDocumentByPath(proj.id, remotePath);
+                    }
+                    const changedSinceLastRead = Boolean(before && before.lastReadVersion !== undefined && version !== null && before.lastReadVersion !== version);
+                    const remoteChanged = Boolean(before && before.lastReadRemoteEdits !== undefined && remoteEdits !== null && remoteEdits > before.lastReadRemoteEdits);
+                    if (realtime)
+                        realtime.noteRead(remotePath);
+                    if (command.inline === true || Number.isInteger(command.offset) || Number.isInteger(command.limit)) {
+                        const sliced = sliceLines(content, command.offset, command.limit);
+                        let text = sliced.text;
+                        let truncated = false;
+                        const encoded = Buffer.from(text, 'utf-8');
+                        if (encoded.byteLength > LIVE_INLINE_LIMIT_BYTES) {
+                            text = encoded.subarray(0, LIVE_INLINE_LIMIT_BYTES).toString('utf-8');
+                            truncated = true;
+                        }
+                        console.log(JSON.stringify({
+                            status: 'ok', op, path: remotePath, transport: resultTransport, mode: 'inline',
+                            offset: sliced.offset, limit: sliced.limit ?? null, total: sliced.total,
+                            bytes: Buffer.byteLength(text, 'utf-8'), truncated,
+                            version, tracked, stale, rejoined, changedSinceLastRead, remoteChanged,
+                            content: text, elapsedMs: Date.now() - started,
+                        }));
+                        continue;
+                    }
+                    const target = liveMirrorFile(proj.id, remotePath);
+                    const hash = contentHash(content);
+                    const bytes = Buffer.byteLength(content, 'utf-8');
+                    const mtimeMs = writeFileAtomic(target, content);
+                    if (realtime)
+                        realtime.notePull(remotePath, { version: version ?? undefined, hash, bytes, mtimeMs });
+                    mirrorManifest[remotePath] = { version, hash, bytes, mtimeMs, at: new Date().toISOString() };
+                    writeLiveManifest(proj.id, mirrorManifest);
+                    console.log(JSON.stringify({
+                        status: 'ok', op, path: remotePath, transport: resultTransport, mode: 'file',
+                        file: target, bytes, hash, version, tracked, stale, rejoined,
+                        changedSinceLastRead, remoteChanged, elapsedMs: Date.now() - started,
+                    }));
+                    continue;
+                }
+                if (op === 'stat') {
+                    const requested = typeof command.path === 'string' && command.path ? [command.path] : mirroredPaths();
+                    const documents = requested.map(p => {
+                        const normalized = p.replace(/^\/+/, '');
+                        const report = realtime ? realtime.report(normalized) : undefined;
+                        let mirrorFile;
+                        let fileHash;
+                        try {
+                            mirrorFile = liveMirrorFile(proj.id, normalized);
+                            if (existsSync(mirrorFile))
+                                fileHash = contentHash(readFileSync(mirrorFile, 'utf-8'));
+                        }
+                        catch {
+                            mirrorFile = undefined;
+                        }
+                        return {
+                            path: normalized,
+                            file: mirrorFile ?? null,
+                            tracked: report?.tracked ?? false,
+                            stale: report?.stale ?? false,
+                            version: report?.version ?? null,
+                            hash: fileHash ?? null,
+                            inSync: Boolean(report && report.version !== undefined && report.version === report.lastPulledVersion &&
+                                fileHash !== undefined && fileHash === report.lastPulledHash),
+                            changedSinceLastRead: Boolean(report && report.lastReadVersion !== undefined && report.version !== undefined && report.lastReadVersion !== report.version),
+                            remoteChanged: Boolean(report && report.lastReadRemoteEdits !== undefined && report.remoteEdits > report.lastReadRemoteEdits),
+                            remoteEdits: report?.remoteEdits ?? 0,
+                            lastReadVersion: report?.lastReadVersion ?? null,
+                            lastPulledVersion: report?.lastPulledVersion ?? null,
+                            lastPullAt: report?.lastPulledAt ? new Date(report.lastPulledAt).toISOString() : null,
+                            pulls: report?.pulls ?? 0,
+                        };
+                    });
+                    console.log(JSON.stringify({ status: 'ok', op, transport, documents, count: documents.length, elapsedMs: Date.now() - started }));
+                    continue;
+                }
+                if (op === 'mirror') {
+                    if (command.stop === true) {
+                        stopMirror();
+                        console.log(JSON.stringify({ status: 'ok', op, mirror: 'stopped', elapsedMs: Date.now() - started }));
+                        continue;
+                    }
+                    if (!realtime)
+                        throw new Error('mirror requires the realtime transport; drop --transport http');
+                    if (Number.isInteger(command.intervalMs) && command.intervalMs >= 200)
+                        mirrorIntervalMs = command.intervalMs;
+                    if (command.quiet === true)
+                        mirrorQuiet = true;
+                    if (Array.isArray(command.paths)) {
+                        for (const p of command.paths)
+                            if (typeof p === 'string' && p)
+                                mirrorPaths.add(p.replace(/^\/+/, ''));
+                    }
+                    else {
+                        for (const p of mirroredPaths())
+                            mirrorPaths.add(p);
+                    }
+                    startMirror();
+                    void runMirror();
+                    console.log(JSON.stringify({
+                        status: 'ok', op, mirror: 'running', intervalMs: mirrorIntervalMs, quiet: mirrorQuiet,
+                        paths: [...mirrorPaths].sort(), elapsedMs: Date.now() - started,
+                    }));
                     continue;
                 }
                 if (!['write', 'replace', 'insert', 'append', 'prepend'].includes(op)) {
@@ -851,7 +1128,17 @@ program
             catch (error) {
                 console.log(JSON.stringify({ status: 'error', message: error.message, elapsedMs: Date.now() - started }));
             }
+            finally {
+                opInFlight = false;
+                // A mirror tick that arrived while this op was running deferred
+                // itself; run it now that the connection is free.
+                if (mirrorPending && !mirrorBusy) {
+                    mirrorPending = false;
+                    setImmediate(() => { void runMirror(); });
+                }
+            }
         }
+        stopMirror();
         realtime?.close();
     }
     catch (error) {

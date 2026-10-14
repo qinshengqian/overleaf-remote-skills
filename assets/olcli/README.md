@@ -223,6 +223,10 @@ returns the selected `transport` plus measured `elapsedMs`.
 
 ```bash
 olcli live "My Thesis"
+{"op":"read","path":"main.tex"}
+{"op":"read","path":"main.tex","offset":1,"limit":40}
+{"op":"ls"}
+{"op":"mirror","intervalMs":1000}
 {"op":"replace","path":"main.tex","search":"old","replacement":"new"}
 {"op":"insert","path":"main.tex","anchor":"\\end{document}","text":"Appendix text\\n","before":true}
 {"op":"write","path":"chapters/new.tex","content":"\\section{New}"}
@@ -231,6 +235,15 @@ olcli live "My Thesis"
 {"op":"refresh"}
 {"op":"quit"}
 ```
+
+`read` returns a document's current text from the joined copy instead of
+downloading it: a full read is written under `~/.olcli/live/<projectId>/` and
+answered with the local path, while an `offset`/`limit` read returns a bounded
+slice inline. `ls` lists the project's documents and files, and `stat` reports
+whether the local copy is still in sync. `mirror` keeps it that way, pulling the
+remote down whenever the content changes, so a local read is never stale by
+more than a moment. Treat the mirror as read-only and edit through the
+operations above.
 
 Every OT write waits for Overleaf's versioned apply acknowledgement. Add
 `--verify` for an extra document rejoin and exact comparison. Use
