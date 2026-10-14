@@ -227,6 +227,12 @@ olcli-live read paper
 olcli-live attach paper
 ```
 
+On macOS and Linux, `install_olcli.sh` creates that `olcli-live` symlink for you,
+next to whichever `olcli` is on your PATH. **Windows is out of scope for this
+section**: both helpers are bash scripts with no PowerShell twin, and the
+installer deliberately does not link them there. On Windows, start `olcli live`
+per request and use the one-shot commands for single edits.
+
 `run-live.sh` wraps `olcli live` in a restart loop, because tmux has no
 restart-on-crash of its own; running it that way also leaves each crash's exit
 code and timestamp in the pane's scrollback. Use one window per project. A tmux

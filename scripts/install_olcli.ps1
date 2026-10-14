@@ -40,6 +40,11 @@ try {
   Pop-Location
 }
 
+# Deliberately absent here, unlike install_olcli.sh: that script links the tmux
+# session helpers (scripts/run-live.sh, scripts/olcli-live) onto PATH. They are
+# bash scripts with no PowerShell twin, and Windows has no tmux, so this
+# workflow is macOS/Linux only. See "Keeping a session alive with tmux" in
+# references/commands.md.
 Write-Host "Installed: $((Get-Command olcli).Source)"
 olcli --version
 Write-Host "Next: read references/setup-and-cookie.md, then pipe the cookie to olcli auth --stdin."

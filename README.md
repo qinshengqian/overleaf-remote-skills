@@ -167,7 +167,8 @@ window per project) so it outlives the terminal that started it. The skill ships
 two scripts for this: `scripts/run-live.sh` keeps the session running and
 restarts it if it exits, and `scripts/olcli-live` sends operations and waits for
 their replies. One tmux server serves every terminal on the machine, so several
-sessions share a single connection. See
+sessions share a single connection. This is macOS and Linux only; on Windows,
+start `olcli live` per request. See
 [keeping a session alive with tmux](references/commands.md#keeping-a-session-alive-with-tmux-macoslinux).
 
 ## Safety and compatibility
