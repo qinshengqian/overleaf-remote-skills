@@ -108,14 +108,22 @@ olcli list --limit 5
 
 Do not perform remote mutations if either command fails.
 
-## Choose an editing mode
+## Choose how to reach the project
+
+`olcli live` is the default interface to a project, for reading as much as for
+editing. If a session covers the project, use it; start one if not. The
+one-shot commands are the fallback when no session exists, or when you need the
+bytes on local disk.
 
 | Situation | Recommended command | Behavior |
 | --- | --- | --- |
-| One or a few precise edits | `olcli replace`, `insert`, `append`, or `prepend` | Opens a short-lived connection and verifies the change |
+| Read or inspect a project | `olcli live` then `{"op":"ls"}` / `{"op":"read",...}` | Serves text from the joined copy; a full read is mirrored under `~/.olcli/live/` |
+| Keep a local copy current | `olcli live` then `{"op":"mirror","intervalMs":1000}` | Pulls the remote down whenever it changes; reports `remoteChanged` |
+| One or a few precise edits, no session | `olcli replace`, `insert`, `append`, or `prepend` | Opens a short-lived connection and verifies the change |
 | Several edits in one session | `olcli live "My Paper"` | Reuses one WebSocket and lazily joins documents |
 | Require the low-latency path | `olcli live "My Paper" --transport ot` | Fails instead of falling back when OT is unavailable |
 | Diagnose an older self-hosted instance | `olcli live "My Paper" --transport http` | Uses verified HTTP document replacement |
+| Need the bytes on disk | `olcli download`, `olcli zip`, `olcli pdf` | Writes a file locally |
 
 Existing text is never replaced wholesale. `edit` and `write` only fill a
 document that is still empty, and `upload --to` refuses to land on a non-empty

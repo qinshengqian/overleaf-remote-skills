@@ -3,6 +3,16 @@
 Use a quoted project name or its 24-character project ID. IDs avoid ambiguity.
 Omit the project only when the current directory has a valid `.olcli.json`.
 
+## Prefer the live session
+
+If the project has a persistent `olcli live` session, do the work through it
+(see [Persistent real-time session](#persistent-real-time-session)). It reads
+and writes without downloading whole files, and it knows whether the text you
+last read is still current. The one-shot commands below are the fallback for
+when no session covers the project, or when you genuinely need bytes on local
+disk. In particular, do not `download` a document to read it while a session is
+running: use `{"op":"read",...}`.
+
 ## Editing rules
 
 Always edit against the live remote content. Do not download a file, modify a
@@ -28,7 +38,21 @@ olcli create "Experiment Paper"
 
 Creating a project changes the account; obtain authorization first.
 
-## Read and download
+## Read a document
+
+Through a live session, the text comes from the session's joined copy and a full
+read is captured under `~/.olcli/live/<projectId>/`:
+
+```json
+{"op":"ls"}
+{"op":"read","path":"sections/02-results_main.tex"}
+{"op":"read","path":"sections/02-results_main.tex","offset":1,"limit":40}
+{"op":"stat"}
+{"op":"mirror","intervalMs":1000}
+```
+
+Without a session, or when you need the bytes on local disk (a ZIP, a binary,
+compile output):
 
 ```bash
 olcli download main.tex "My Paper" --output /tmp/main.tex
