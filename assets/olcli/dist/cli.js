@@ -12,6 +12,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, statSync } from 'no
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { execFileSync } from 'node:child_process';
 import { OverleafClient } from './client.js';
 import { RealtimeUnavailableError } from './realtime.js';
 import { LIVE_INLINE_LIMIT_BYTES, LIVE_MIRROR_DEFAULT_INTERVAL_MS, contentHash, liveMirrorFile, readLiveManifest, sliceLines, writeFileAtomic, writeLiveManifest, } from './livePaths.js';
@@ -871,6 +872,21 @@ program
                 throw new Error(`${op} requires text`);
             return op === 'append' ? existing + command.text : command.text + existing;
         };
+        // A tty in canonical mode caps one input line at MAX_CANON (1024 bytes on
+        // macOS) and silently discards anything longer, the terminating newline
+        // included. A request bigger than that, which is any sizable LaTeX edit,
+        // would therefore never arrive, and the driver would sit out its timeout
+        // against a wedged input buffer. Keep ICANON off so a request of any size
+        // is delivered as it is typed, but leave ECHO on: scripts/olcli-live pairs
+        // each request with its reply by matching the echoed line in the pane.
+        if (process.stdin.isTTY) {
+            try {
+                execFileSync('stty', ['-icanon', 'min', '1', 'time', '0'], { stdio: ['inherit', 'ignore', 'ignore'] });
+            }
+            catch {
+                // Best effort. Without stty the 1024-byte canonical limit still applies.
+            }
+        }
         const rl = createInterface({ input: process.stdin, crlfDelay: Infinity, terminal: false });
         for await (const rawLine of rl) {
             const line = rawLine.trim();

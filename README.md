@@ -120,6 +120,7 @@ bytes on local disk.
 | Read or inspect a project | `olcli live` then `{"op":"ls"}` / `{"op":"read",...}` | Serves text from the joined copy; a full read is mirrored under `~/.olcli/live/` |
 | Keep a local copy current | `olcli live` then `{"op":"mirror","intervalMs":1000}` | Pulls the remote down whenever it changes; reports `remoteChanged` |
 | One or a few precise edits, no session | `olcli replace`, `insert`, `append`, or `prepend` | Opens a short-lived connection and verifies the change |
+| See what an edit changed | `scripts/olcli-live send` / `diff` | Text edits snapshot the document and print a unified diff |
 | Several edits in one session | `olcli live "My Paper"` | Reuses one WebSocket and lazily joins documents |
 | Require the low-latency path | `olcli live "My Paper" --transport ot` | Fails instead of falling back when OT is unavailable |
 | Diagnose an older self-hosted instance | `olcli live "My Paper" --transport http` | Uses verified HTTP document replacement |
@@ -173,7 +174,9 @@ next operation. Responses identify the transport, verification state, and
 elapsed time. `read` mirrors a document into `~/.olcli/live/` and `mirror` keeps
 that copy in sync with the remote; see the
 [complete command guide](references/commands.md) for all operations and
-protocol fields.
+protocol fields. To see what a text edit changed, apply it through
+`scripts/olcli-live send <window> '<json-op>'`, which prints a unified diff of
+the before and after text.
 
 For work that spans more than one sitting, host the session in `tmux` (one
 window per project) so it outlives the terminal that started it. The skill ships

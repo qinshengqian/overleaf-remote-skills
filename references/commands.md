@@ -96,6 +96,10 @@ olcli prepend notes.tex $'% generated remotely\n' "My Paper"
 search more specific instead of using `--all` when only one location should
 change. `insert` uses the first anchor unless `--occurrence` is supplied.
 
+These one-shot commands reply with status and size only. When the change should
+be reviewable as a diff, use the live session instead: see
+[Reviewing what an edit changed](#reviewing-what-an-edit-changed).
+
 PowerShell multiline input:
 
 ```powershell
@@ -313,6 +317,44 @@ olcli-live attach paper
 for a ranged read), `files` lists the project, `status` shows reconciliation
 state, and `mirror` / `mirror-stop` drive the auto-pull mirror. `read` is the
 odd one out: it shows the tail of the tmux pane, not a document.
+
+### Reviewing what an edit changed
+
+An edit reply reports the document's new size, not the text that changed, and
+the mirror overwrites its copy on the next read, so neither can tell you
+afterwards what the edit did. `olcli-live send` closes that gap: when the op is
+a text edit it snapshots the document, applies the op, reads it again, and
+prints a unified diff.
+
+```bash
+olcli-live send paper '{"op":"replace","path":"main.tex","search":"old","replacement":"new"}'
+olcli-live send paper '{"op":"insert","path":"sections/02.tex","anchor":"\\end{itemize}","text":"\n\\item Added.","before":true}'
+olcli-live send paper '{"op":"write","path":"chapters/new.tex","content":"\\section{New}"}'
+```
+
+An edit prints a one-line summary plus the diff, for example
+`[edit] replace main.tex: ok (transport=ot, 1 hunks, +1 -1, 21 bytes)`. This
+applies to `replace`, `insert`, `append`, `prepend`, and `write`. Other
+operations (`read`, `stat`, `mirror`, `compile`, `upload`) still print their raw
+JSON reply; `upload` has no diff because a binary has none.
+
+- The baseline is the session's own copy, the text the op was applied to, so the
+  diff covers exactly this edit. If another connection edits in between, the
+  after-read sets `remoteChanged` and the helper warns that the diff may mix in
+  their text.
+- A `write` to a path that does not exist yet is labelled `(new file)` and shows
+  the document as wholly added. A baseline read that fails for any other reason
+  is labelled `(baseline unavailable)` with a warning.
+- Each document's last before/after pair is cached under
+  `~/.cache/olcli-live/<window>/`. `olcli-live diff <window>` lists the cached
+  edits for that window; `olcli-live diff <window> <path>` reprints one.
+- `OLCLI_DIFF_CONTEXT` sets the unified context (default 3) and
+  `OLCLI_DIFF_MAX_LINES` caps the printed output (default 400); truncation is
+  reported rather than silent.
+
+Two paths still bypass the helper and print no diff: typing raw `{"op":...}`
+lines straight into an `olcli live` process, and the one-shot commands below,
+which have no session to snapshot against.
 
 On macOS and Linux, `install_olcli.sh` creates that `olcli-live` symlink for you,
 next to whichever `olcli` is on your PATH. **Windows is out of scope for this

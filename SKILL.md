@@ -49,6 +49,19 @@ uncertain writes are never retried blindly. Use `--transport ot` to require OT
 or `--transport http` to diagnose compatibility with older self-hosted
 instances.
 
+An edit reply reports the document's new size, not what changed. `olcli-live
+send` closes that gap: when the op changes text it snapshots the document,
+applies the op, reads it again, and prints a unified diff of the change.
+
+```bash
+olcli-live send paper '{"op":"replace","path":"main.tex","search":"old","replacement":"new"}'
+olcli-live diff paper main.tex
+```
+
+The last pair stays cached, so `diff` can reprint it after the mirror has moved
+on. `upload` and the control ops still print their raw JSON reply, because a
+binary has nothing to diff.
+
 ## Hosting the session
 
 On macOS or Linux with `tmux`, keep the session alive rather than starting a new
@@ -115,9 +128,14 @@ edits.
 9. Preserve the built-in versioned OT acknowledgement or HTTP read-after-write
    verification. For binary uploads, download to a temporary file and compare
    hashes or bytes when correctness matters.
-10. Do not start a pull/push daemon unless the user explicitly asks for ongoing
+10. Review what the write actually did. Through a tmux session, `olcli-live
+    send` prints the unified diff of every text edit; check that diff before
+    moving on. `olcli-live diff <window> <path>` reprints the last one. Raw
+    `{"op":...}` lines typed straight into `olcli live`, and the one-shot
+    commands, print no diff.
+11. Do not start a pull/push daemon unless the user explicitly asks for ongoing
     synchronization. The direct commands are designed to avoid that workflow.
-11. After repeated authentication failures, ask the user to refresh the cookie;
+12. After repeated authentication failures, ask the user to refresh the cookie;
     do not keep retrying a possibly expired credential.
 
 ## Bundled implementation

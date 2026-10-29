@@ -3,10 +3,10 @@
 #
 #   olcli-live ls                        list project windows
 #   olcli-live read <window> [lines]     show the last lines of a window (tmux pane)
-#   olcli-live send <window> '<json-op>' send one operation, wait for its reply
+#   olcli-live send <window> '<json-op>' send one operation; text edits also print a diff
 #   olcli-live attach [window]           attach interactively (Ctrl-b d to detach)
 #
-# Convenience wrappers around the read/mirror operations, all printing the raw
+# Convenience wrappers around the read/mirror operations, printing the raw
 # one-line JSON reply (cat prints just the local file path, or inline content):
 #
 #   olcli-live files <window>                       list remote documents and files
@@ -16,6 +16,15 @@
 #   olcli-live status <window> [path]               reconciliation state (inSync, remoteChanged)
 #   olcli-live mirror <window> [intervalMs]         start the auto-pull mirror
 #   olcli-live mirror-stop <window>                 stop it
+#
+# `send` is the single entry point for operations. When the op changes text it
+# also prints a unified diff of the change; `diff` reprints the last one later.
+#
+#   olcli-live send <window> '<json-op>'            send one operation; a text edit is
+#                                                   snapshotted before and after, and its
+#                                                   unified diff is printed
+#   olcli-live diff <window> [path]                 reprint the last cached diff, or list the
+#                                                   cached edits for the window
 #
 # The session name defaults to `olcli`; override it with OLCLI_TMUX_SESSION.
 # Put this on PATH to use it as `olcli-live`:
@@ -33,7 +42,7 @@ usage() {
 usage:
   olcli-live ls                        list project windows
   olcli-live read <window> [lines]     show the last lines of a window (default 20)
-  olcli-live send <window> '<json-op>' send one operation and wait for its reply
+  olcli-live send <window> '<json-op>' send one operation; text edits also print a diff
   olcli-live attach [window]           attach interactively (Ctrl-b d to detach)
   olcli-live files <window>            list remote documents and files
   olcli-live cat <window> <path> [offset] [limit]
@@ -42,6 +51,7 @@ usage:
   olcli-live mirror <window> [intervalMs]
                                        start the auto-pull mirror
   olcli-live mirror-stop <window>      stop the auto-pull mirror
+  olcli-live diff <window> [path]      reprint the last cached diff, or list cached edits
 EOF
   exit 2
 }
@@ -54,15 +64,39 @@ json_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 # its reply. Using the last echo means repeating an identical operation still
 # matches the right reply. -J re-joins lines tmux wrapped for display, so a
 # narrow pane cannot split the JSON across rows.
+#
+# The op reaches awk through the environment, not `awk -v op="$op"`: -v runs the
+# value through awk's escape processing, so every JSON op carrying a backslash
+# (that is, most LaTeX edits, where "\\noindent" collapses to "\noindent") would
+# no longer equal the echoed request line, the match would fail, and the caller
+# would sit out the full timeout even though the write itself had succeeded.
 send_op() {
   local target="$1" op="$2" resp
   tmux has-session -t "$SESS" 2>/dev/null || { echo "no tmux session '$SESS'" >&2; exit 1; }
+  # A tty in canonical mode caps one input line at MAX_CANON (1024 bytes on
+  # macOS) and silently discards anything longer, the terminating newline
+  # included. The request then never arrives, the reply never comes, and the
+  # full line wedges the input buffer so every later send is swallowed too.
+  # `olcli live` turns ICANON off for its stdin, so refuse an over-long op only
+  # when that has not happened: an older olcli, or a tty it could not adjust.
+  local n pane_tty
+  n=$(printf '%s' "$op" | LC_ALL=C wc -c | tr -d '[:space:]')
+  if [ "${n:-0}" -ge 1024 ]; then
+    pane_tty=$(tmux display-message -p -t "$target" '#{pane_tty}' 2>/dev/null || true)
+    if [ -z "$pane_tty" ] ||
+       stty -f "$pane_tty" -a 2>/dev/null | grep -Eq '(^|[[:space:]])icanon([[:space:]]|$)'; then
+      echo "olcli-live: op is $n bytes and the pane's tty is in canonical mode, which drops any line of 1024 bytes or more." >&2
+      echo "olcli-live: use an olcli whose live mode disables ICANON, or split the edit into several ops." >&2
+      return 1
+    fi
+  fi
   # -l sends the text literally. Without it tmux reads words such as "Enter"
   # inside the JSON as key names.
   tmux send-keys -t "$target" -l "$op"
   tmux send-keys -t "$target" Enter
   for _ in $(seq 1 300); do
-    resp=$(tmux capture-pane -pJ -t "$target" -S - | awk -v op="$op" '
+    resp=$(tmux capture-pane -pJ -t "$target" -S - | OP="$op" awk '
+      BEGIN { op = ENVIRON["OP"] }
       { b[NR] = $0 }
       END {
         last = 0
@@ -76,6 +110,175 @@ send_op() {
     sleep 0.2
   done
   echo "olcli-live: timed out waiting for a reply from $target" >&2; return 1
+}
+
+# ── Reviewable edits ─────────────────────────────────────────────────────────
+#
+# A live edit reply reports the document's new size, not what changed. The
+# local mirror cannot answer that either: a read overwrites it, and it follows
+# the remote, so by the time anyone looks again the "before" text is gone. This
+# wrapper keeps the record itself: read the document, keep that copy, send the
+# op, read again, and diff the two. The pair is cached under
+# ~/.cache/olcli-live/<window>/ so `olcli-live diff` can show the same change
+# afterwards.
+#
+# The baseline is the session's own copy, the same text the op is applied to,
+# so the diff covers exactly what this op changed. If another connection edits
+# in between, the after-read reports remoteChanged and the diff is labelled
+# accordingly, because it then mixes our change with theirs.
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 ||
+    { echo "olcli-live: jq is required for edit and diff" >&2; exit 1; }
+}
+
+cache_root() { printf '%s/%s' "${XDG_CACHE_HOME:-$HOME/.cache}/olcli-live" "$1"; }
+
+# Flatten the remote path into one file name. The remote path appears in the
+# diff labels, so the cache key only has to be collision-free and traversal-safe.
+cache_key() { printf '%s' "$1" | sed -e 's#^/*##' -e 's#/#__#g'; }
+
+reply_field() {
+  printf '%s' "$1" | jq -r --arg key "$2" '.[$key] // empty' 2>/dev/null
+}
+
+live_read() { # window path
+  send_op "$SESS:$1" "{\"op\":\"read\",\"path\":\"$(json_str "$2")\"}"
+}
+
+# Fills DIFF_TEXT / DIFF_HUNKS / DIFF_ADDS / DIFF_DELS. Returns nonzero only
+# when diff itself failed (not when the files differ: that is exit 1).
+compute_diff() { # before after label
+  local before="$1" after="$2" label="$3" ctx rc
+  ctx="${OLCLI_DIFF_CONTEXT:-3}"
+  case "$ctx" in ''|*[!0-9]*) ctx=3 ;; esac
+  DIFF_TEXT=$(diff -u -U"$ctx" -L "a/$label" -L "b/$label" "$before" "$after")
+  rc=$?
+  if [ "$rc" -gt 1 ]; then
+    DIFF_TEXT=''; DIFF_HUNKS=0; DIFF_ADDS=0; DIFF_DELS=0
+    return 1
+  fi
+  # The file headers are "---"/"+++"; exclude them so an unchanged file does
+  # not count as one deletion and one addition.
+  read -r DIFF_HUNKS DIFF_ADDS DIFF_DELS <<EOF
+$(printf '%s\n' "$DIFF_TEXT" | awk '
+  /^@@/ { hunks++ }
+  /^\+/ && !/^\+\+\+/ { adds++ }
+  /^-/ && !/^---/ { dels++ }
+  END { printf "%d %d %d\n", hunks, adds, dels }
+')
+EOF
+}
+
+show_diff() { # label
+  local label="$1" max total
+  max="${OLCLI_DIFF_MAX_LINES:-400}"
+  case "$max" in ''|*[!0-9]*) max=400 ;; esac
+  [ "$max" -gt 0 ] || max=400
+  if [ "${DIFF_HUNKS:-0}" -eq 0 ]; then
+    printf '[diff] %s: no textual change\n' "$label"
+    return 0
+  fi
+  if [ -n "$DIFF_TEXT" ]; then
+    total=$(printf '%s\n' "$DIFF_TEXT" | wc -l | tr -d '[:space:]')
+    if [ "$total" -gt "$max" ]; then
+      printf '%s\n' "$DIFF_TEXT" | head -n "$max"
+      printf '[diff] truncated: showing %s of %s lines; raise OLCLI_DIFF_MAX_LINES for the rest\n' \
+        "$max" "$total"
+    else
+      printf '%s\n' "$DIFF_TEXT"
+    fi
+  fi
+  return 0
+}
+
+# Snapshot, apply, re-read, diff. `send` routes every text edit here, so an edit
+# reply never lacks the change itself. The pair is cached for `diff`.
+send_text_edit() { # window op
+  local win="$1" op="$2" kind path work before after before_absent baseline_missing \
+        before_reply before_file reply after_reply after_file label remote_changed \
+        dir flat rcflag
+  kind=$(printf '%s' "$op" | jq -r '.op // empty' 2>/dev/null)
+  path=$(printf '%s' "$op" | jq -r '.path // empty' 2>/dev/null)
+  if [ -z "$path" ]; then
+    echo "olcli-live send: a text edit needs a path" >&2; exit 2
+  fi
+
+  work=$(mktemp -d "${TMPDIR:-/tmp}/olcli-live.XXXXXX") || exit 1
+  before="$work/before"; after="$work/after"
+  before_absent=false; baseline_missing=false
+
+  # Baseline: the document as this session holds it now, which is the text the
+  # op will be applied to. A document that does not exist yet (a new `write`)
+  # has no baseline; any other read failure is reported, because the diff would
+  # otherwise present the whole document as an addition.
+  before_reply=$(live_read "$win" "$path" || true)
+  before_file=$(reply_field "$before_reply" file)
+  if [ "$(reply_field "$before_reply" status)" = ok ] && [ -n "$before_file" ] && [ -f "$before_file" ]; then
+    cp "$before_file" "$before" || { rm -rf "$work"; exit 1; }
+  else
+    : > "$before"
+    case "$(reply_field "$before_reply" message)" in
+      *[Nn]ot\ found*) before_absent=true ;;
+      *) baseline_missing=true ;;
+    esac
+  fi
+
+  reply=$(send_op "$SESS:$win" "$op") || { rm -rf "$work"; exit 1; }
+  if [ "$(reply_field "$reply" status)" != ok ]; then
+    printf '%s\n' "$reply"
+    rm -rf "$work"; exit 1
+  fi
+
+  after_reply=$(live_read "$win" "$path" || true)
+  after_file=$(reply_field "$after_reply" file)
+  if [ "$(reply_field "$after_reply" status)" != ok ] || [ -z "$after_file" ] || [ ! -f "$after_file" ]; then
+    printf '%s\n' "$reply"
+    echo "olcli-live send: the edit was applied, but the document could not be re-read; no diff available." >&2
+    rm -rf "$work"; exit 1
+  fi
+  cp "$after_file" "$after" || { rm -rf "$work"; exit 1; }
+
+  label="$path"
+  $before_absent && label="$path (new file)"
+  $baseline_missing && label="$path (baseline unavailable)"
+  if ! compute_diff "$before" "$after" "$label"; then
+    rm -rf "$work"
+    echo "olcli-live send: diff failed" >&2
+    exit 1
+  fi
+  remote_changed=$(reply_field "$after_reply" remoteChanged)
+
+  printf '[edit] %s %s: ok (transport=%s, %s hunks, +%s -%s, %s bytes)\n' \
+    "$kind" "$path" "$(reply_field "$reply" transport)" \
+    "${DIFF_HUNKS:-0}" "${DIFF_ADDS:-0}" "${DIFF_DELS:-0}" "$(reply_field "$reply" bytes)"
+  if [ "$baseline_missing" = true ]; then
+    echo "olcli-live send: warning: the document could not be read before the edit, so the diff has no baseline and shows the whole file as added." >&2
+  fi
+  if [ "$remote_changed" = true ]; then
+    echo "olcli-live send: warning: another connection edited this document during the change; the diff may mix in their text." >&2
+  fi
+  show_diff "$label"
+
+  # Keep the last pair per document so the change can be reviewed again later,
+  # after the mirror has been overwritten by a newer read.
+  dir=$(cache_root "$win"); flat=$(cache_key "$path")
+  if mkdir -p "$dir" 2>/dev/null &&
+     cp "$before" "$dir/$flat.before" 2>/dev/null &&
+     cp "$after" "$dir/$flat.after" 2>/dev/null; then
+    rcflag=false; [ "$remote_changed" = true ] && rcflag=true
+    jq -n --arg kind "$kind" --arg path "$path" --arg at "$(date '+%F %T')" \
+          --arg transport "$(reply_field "$reply" transport)" \
+          --argjson hunks "${DIFF_HUNKS:-0}" --argjson adds "${DIFF_ADDS:-0}" \
+          --argjson dels "${DIFF_DELS:-0}" --argjson remoteChanged "$rcflag" \
+          --argjson newFile "$before_absent" --argjson baselineMissing "$baseline_missing" \
+          '{kind:$kind,path:$path,at:$at,transport:$transport,hunks:$hunks,
+            adds:$adds,dels:$dels,remoteChanged:$remoteChanged,newFile:$newFile,
+            baselineMissing:$baselineMissing}' \
+          > "$dir/$flat.meta.json" 2>/dev/null || true
+  fi
+
+  rm -rf "$work"
 }
 
 cmd="${1:-}"; shift || true
@@ -94,7 +297,15 @@ case "$cmd" in
   send)
     win="${1:?usage: olcli-live send <window> '<json-op>'}"; shift
     op="$*"; [ -n "$op" ] || usage
-    send_op "$SESS:$win" "$op" ;;
+    if command -v jq >/dev/null 2>&1; then
+      case "$(printf '%s' "$op" | jq -r '.op // empty' 2>/dev/null)" in
+        replace|insert|append|prepend|write) send_text_edit "$win" "$op" ;;
+        *) send_op "$SESS:$win" "$op" ;;
+      esac
+    else
+      echo "olcli-live send: jq not found; sending without a diff for text edits" >&2
+      send_op "$SESS:$win" "$op"
+    fi ;;
   files)
     win="${1:?usage: olcli-live files <window>}"
     send_op "$SESS:$win" '{"op":"ls"}' ;;
@@ -115,6 +326,33 @@ case "$cmd" in
   mirror-stop)
     win="${1:?usage: olcli-live mirror-stop <window>}"
     send_op "$SESS:$win" '{"op":"mirror","stop":true}' ;;
+  diff)
+    require_jq
+    win="${1:?usage: olcli-live diff <window> [path]}"; shift || true
+    dir=$(cache_root "$win")
+    if [ -z "${1:-}" ]; then
+      metas=("$dir"/*.meta.json)
+      if [ ! -e "${metas[0]}" ]; then
+        echo "olcli-live: no cached edits for '$win'" >&2; exit 1
+      fi
+      for meta in "${metas[@]}"; do
+        jq -r '"\(.at)  \(.kind)  \(.path)  +\(.adds) -\(.dels)\(if .remoteChanged then "  (remote edits during change)" else "" end)"' \
+          "$meta" 2>/dev/null
+      done | sort
+      exit 0
+    fi
+    path="$1"; flat=$(cache_key "$path")
+    before="$dir/$flat.before"; after="$dir/$flat.after"; meta="$dir/$flat.meta.json"
+    if [ ! -f "$before" ] || [ ! -f "$after" ]; then
+      echo "olcli-live: no cached edit for $path in '$win'; apply one through 'olcli-live send' first" >&2
+      exit 1
+    fi
+    [ -f "$meta" ] &&
+      jq -r '"[edit] \(.kind) \(.path) at \(.at): \(.hunks) hunks, +\(.adds) -\(.dels)"' "$meta" 2>/dev/null
+    if ! compute_diff "$before" "$after" "$path"; then
+      echo "olcli-live: diff failed" >&2; exit 1
+    fi
+    show_diff "$path" ;;
   cat)
     win="${1:?usage: olcli-live cat <window> <path> [offset] [limit]}"; shift || true
     path="${1:?usage: olcli-live cat <window> <path> [offset] [limit]}"; shift || true
