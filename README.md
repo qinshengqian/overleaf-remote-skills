@@ -219,13 +219,6 @@ scripts/                       Installers, checkers, and the tmux session helper
 assets/olcli/                  Enhanced olcli source, build, and tests
 ```
 
-## Star history
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history-dark.svg">
-  <img alt="Star history chart for qinshengqian/overleaf-remote-skills" src="assets/star-history.svg">
-</picture>
-
 ## Attribution and license
 
 The bundled CLI is based on the MIT-licensed
